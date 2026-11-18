@@ -765,10 +765,10 @@ def _run_msh(message, raw):
 # START MENU
 # ═══════════════════════════════════════════════════════════════════
 def cbtn(text, data=None, url=None, style=None):
+    """Telegram Bot API rejects unknown fields — style is ignored, not sent."""
     b = {"text": text}
     if data is not None: b["callback_data"] = data
     if url is not None: b["url"] = url
-    if style in ("primary", "success", "danger"): b["style"] = style
     return b
 
 def ckb(*rows):
