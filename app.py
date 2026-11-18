@@ -53,9 +53,11 @@ from complete_handler import (
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════
-BOT_TOKEN    = "8663538819:AAGO37R2Nua2K_T1KZzBLyeYvEgfs_CwB6Q"
-OWNER_ID     = [5963548505, 5547897619]
-DARKS_ID     = 5963548505
+# ---------- CONFIG ----------
+BOT_TOKEN = "8533961422:AAGzOHNJEIeM7bsqb-qOW-fgErwgJ2jPV0U"
+OWNER_ID = [5963548505, 5547897619]    # keep your owner IDs
+DARKS_ID = 5963548505
+
 FREE_GROUP_ID = -1003926435438
 REQUIRED_CHATS = ["@Nova_bot_update", "-1003926435438"]
 
@@ -80,7 +82,7 @@ bot = telebot.TeleBot(BOT_TOKEN, num_threads=30)
 # ═══════════════════════════════════════════════════════════════════
 # MONGO + JSON HELPERS
 # ═══════════════════════════════════════════════════════════════════
-uri = "mongodb+srv://rahll_db_user:k0RRXUHqnXMgsCJx@cluster0.aom0bxs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+uri = "mongodb+srv://Prince_Mine_pvt:Meandprincehitting@cluster0.blr8vex.mongodb.net/?appName=Cluster0"
 try:
     _mc = MongoClient(uri, server_api=ServerApi('1'), maxPoolSize=10,
                       connectTimeoutMS=30000, socketTimeoutMS=120000,
