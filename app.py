@@ -26,7 +26,7 @@ from telebot import types
 from pymongo import MongoClient, server_api
 
 # ---------- CONFIG ----------
-BOT_TOKEN = "8935365174:AAELYaLVtNnmReCPrRaNuAPkRfn5K58Yttg"
+BOT_TOKEN = "8533961422:AAGzOHNJEIeM7bsqb-qOW-fgErwgJ2jPV0U"
 OWNER_ID = [5963548505, 5547897619]    # keep your owner IDs
 DARKS_ID = 5963548505
 
