@@ -73,9 +73,9 @@ SETTINGS_FILE      = "settings.json"
 
 # 3 CCs used to validate each Shopify site
 SITE_VALIDATION_CCS = [
-    "5242430428405662|03|28|323",
-    "4517650667292635|08|2028|261",
-    "4242424242424242|12|2028|123",
+    "5242430428405662|03|28|233",
+    "4758330036461678|01|2029|612",
+    "4232230643597128|06|2031|962",
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN, num_threads=30)
