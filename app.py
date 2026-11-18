@@ -53,12 +53,9 @@ from complete_handler import (
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════
-# ---------- CONFIG ----------
-BOT_TOKEN = "8533961422:AAGzOHNJEIeM7bsqb-qOW-fgErwgJ2jPV0U"
-OWNER_ID = [5963548505, 5547897619]    # keep your owner IDs
-DARKS_ID = 5963548505
-
-
+BOT_TOKEN    = "8663538819:AAGO37R2Nua2K_T1KZzBLyeYvEgfs_CwB6Q"
+OWNER_ID     = [5963548505, 5547897619]
+DARKS_ID     = 5963548505
 FREE_GROUP_ID = -1003926435438
 REQUIRED_CHATS = ["@Nova_bot_update", "-1003926435438"]
 
@@ -73,9 +70,9 @@ SETTINGS_FILE      = "settings.json"
 
 # 3 CCs used to validate each Shopify site
 SITE_VALIDATION_CCS = [
-    "5242430428405662|03|28|233",
-    "4758330036461678|01|2029|612",
-    "4232230643597128|06|2031|962",
+    "5242430428405662|03|28|323",
+    "4517650667292635|08|2028|261",
+    "4242424242424242|12|2028|123",
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN, num_threads=30)
@@ -83,7 +80,7 @@ bot = telebot.TeleBot(BOT_TOKEN, num_threads=30)
 # ═══════════════════════════════════════════════════════════════════
 # MONGO + JSON HELPERS
 # ═══════════════════════════════════════════════════════════════════
-uri = "mongodb+srv://Prince_Mine_pvt:Meandprincehitting@cluster0.blr8vex.mongodb.net/?appName=Cluster0"
+uri = "mongodb+srv://rahll_db_user:k0RRXUHqnXMgsCJx@cluster0.aom0bxs.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 try:
     _mc = MongoClient(uri, server_api=ServerApi('1'), maxPoolSize=10,
                       connectTimeoutMS=30000, socketTimeoutMS=120000,
@@ -486,7 +483,6 @@ def parse_proxy_lines(text):
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        # strip trailing gate suffix
         parts = line.split()
         gate = "shopify"
         if len(parts) >= 2 and parts[-1].lower() in ('shopify', 'razorpay'):
@@ -495,7 +491,6 @@ def parse_proxy_lines(text):
         norm = normalize_proxy(line)
         if norm:
             proxies.append((norm, gate))
-    # dedupe by (proxy, gate)
     seen, out = set(), []
     for p, g in proxies:
         k = (p, g)
@@ -526,7 +521,6 @@ def _pop_await(uid, key):
 
 
 def _check_await(uid):
-    """Return the most-recently-set awaiting flag, if any."""
     s = user_sessions.get(uid, {})
     best = None
     best_ts = 0
@@ -553,7 +547,7 @@ def on_document(message):
 
     flag = _check_await(uid)
     if not flag:
-        return  # not waiting for a file — ignore
+        return
 
     _pop_await(uid, flag)
 
@@ -573,6 +567,8 @@ def on_document(message):
         _run_site_validation(message, raw)
     elif flag == 'awaiting_proxy_file':
         _run_proxy_upload(message, raw)
+    elif flag == 'awaiting_cards_file':
+        _run_msh(message, raw)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -702,7 +698,6 @@ def _run_proxy_upload(message, raw):
                 except Exception:
                     pass
 
-    # Persist
     data = read_user_proxies(uid)
     for proxy, gate in live:
         if proxy not in data[gate]:
@@ -720,6 +715,48 @@ def _run_proxy_upload(message, raw):
         f"🛍️ Shopify pool: <b>{sh}</b>\n"
         f"💎 Razorpay pool: <b>{rz}</b>",
         message.chat.id, status.message_id, parse_mode='HTML')
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MSH — SHOPIFY MASS CHECK FLOW
+# ═══════════════════════════════════════════════════════════════════
+def _run_msh(message, raw):
+    uid = message.from_user.id
+
+    ccs = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = re.search(r'(\d{13,19})[|:/\s](\d{1,2})[|:/\s](\d{2,4})[|:/\s](\d{3,4})', line)
+        if m:
+            cc, mm, yyyy, cvv = m.groups()
+            if len(yyyy) == 2:
+                yyyy = "20" + yyyy
+            mm = mm.zfill(2)
+            ccs.append(f"{cc}|{mm}|{yyyy}|{cvv}")
+
+    if not ccs:
+        safe_send(bot.reply_to, message, "❌ No valid cards found.")
+        return
+
+    sites = sites_data.get('sites', [])
+    if not sites:
+        safe_send(bot.reply_to, message, "📭 No global sites to check against.")
+        return
+
+    proxies = get_active_proxies(uid, 'shopify') or []
+
+    start = bot.reply_to(message, f"📦 Starting mass check on {len(ccs)} cards…")
+    try:
+        process_shopify_mass_check(
+            bot, message, start, ccs, sites, proxies,
+            uid, load_json, save_json, USERS_FILE,
+            hit_pref="both", dm_target_user_id=None,
+        )
+    except Exception as e:
+        logger.error(f"msh error: {traceback.format_exc()}")
+        safe_send(bot.send_message, message.chat.id, f"❌ Mass check error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -925,6 +962,7 @@ def cb_site_validate_prompt(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "site_clean_global")
 def cb_site_clean_global(call):
+    global sites_data
     if not is_owner(call.from_user.id):
         bot.answer_callback_query(call.id, "🚫 Owner only.", show_alert=True)
         return
@@ -980,7 +1018,6 @@ def cb_site_clean_global(call):
                 except Exception:
                     pass
 
-    global sites_data
     sites_data['sites'] = keep
     save_json(SITES_FILE, sites_data)
 
@@ -1195,7 +1232,7 @@ def cb_clearproxies_confirm(call):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MASS SHOPIFY CHECK — preserve
+# MASS SHOPIFY CHECK — info panel
 # ═══════════════════════════════════════════════════════════════════
 @bot.callback_query_handler(func=lambda c: c.data == "menu_msh")
 def cb_menu_msh(call):
@@ -1282,6 +1319,7 @@ def cmd_listsites(message):
 
 @bot.message_handler(commands=['rmsite'])
 def cmd_rmsite(message):
+    global sites_data
     if not is_owner(message.from_user.id):
         safe_send(bot.reply_to, message, "🚫 Owner only.")
         return
@@ -1294,14 +1332,14 @@ def cmd_rmsite(message):
     except ValueError:
         safe_send(bot.reply_to, message, "❌ Invalid id.")
         return
-    global sites_data
     before = len(sites_data['sites'])
     sites_data['sites'] = [s for s in sites_data['sites'] if s.get('id') != sid]
     if len(sites_data['sites']) == before:
         safe_send(bot.reply_to, message, f"❌ No site with id #{sid}.")
         return
     save_json(SITES_FILE, sites_data)
-    safe_send(bot.reply_to, message, f"✅ Removed site #{sid}. Remaining: {len(sites_data['sites'])}")
+    safe_send(bot.reply_to, message,
+        f"✅ Removed site #{sid}. Remaining: {len(sites_data['sites'])}")
 
 
 @bot.message_handler(commands=['addmysite'])
@@ -1471,7 +1509,7 @@ def cmd_cleanshpro(message):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MSH — Shopify mass check
+# MSH — Shopify mass check entry
 # ═══════════════════════════════════════════════════════════════════
 @bot.message_handler(commands=['msh'])
 def cmd_msh(message):
@@ -1492,61 +1530,6 @@ def cmd_msh(message):
 @bot.message_handler(commands=['stop'])
 def cmd_stop(message):
     safe_send(bot.reply_to, message, "⏸️ Stop requested.")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# CARDS FILE UPLOAD HANDLER (for /msh)
-# ═══════════════════════════════════════════════════════════════════
-@bot.message_handler(content_types=['document'], func=lambda m: _check_await(m.from_user.id) == 'awaiting_cards_file')
-def on_cards_document(message):
-    uid = message.from_user.id
-    _pop_await(uid, 'awaiting_cards_file')
-
-    if not message.document.file_name.lower().endswith('.txt'):
-        safe_send(bot.reply_to, message, "❌ Please send a .txt file.")
-        return
-
-    try:
-        info = bot.get_file(message.document.file_id)
-        raw = bot.download_file(info.file_path).decode('utf-8', errors='ignore')
-    except Exception as e:
-        safe_send(bot.reply_to, message, f"❌ Download failed: {e}")
-        return
-
-    ccs = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        m = re.search(r'(\d{13,19})[|:/\s](\d{1,2})[|:/\s](\d{2,4})[|:/\s](\d{3,4})', line)
-        if m:
-            cc, mm, yyyy, cvv = m.groups()
-            if len(yyyy) == 2:
-                yyyy = "20" + yyyy
-            mm = mm.zfill(2)
-            ccs.append(f"{cc}|{mm}|{yyyy}|{cvv}")
-
-    if not ccs:
-        safe_send(bot.reply_to, message, "❌ No valid cards found.")
-        return
-
-    sites = sites_data.get('sites', [])
-    if not sites:
-        safe_send(bot.reply_to, message, "📭 No global sites to check against.")
-        return
-
-    proxies = get_active_proxies(uid, 'shopify') or []
-
-    start = bot.reply_to(message, f"📦 Starting mass check on {len(ccs)} cards…")
-    try:
-        process_shopify_mass_check(
-            bot, message, start, ccs, sites, proxies,
-            uid, load_json, save_json, USERS_FILE,
-            hit_pref="both", dm_target_user_id=None,
-        )
-    except Exception as e:
-        logger.error(f"msh error: {traceback.format_exc()}")
-        safe_send(bot.send_message, message.chat.id, f"❌ Mass check error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
