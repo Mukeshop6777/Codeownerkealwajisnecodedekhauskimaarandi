@@ -21,7 +21,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-SHOPIFY_API_ENDPOINT = "http://181.214.147.157:5000/shopify"  # your local API
+SHOPIFY_API_ENDPOINT = "http://91.244.197.173:8080/shopify"  # your local API
 CARD_API_BASE        = "http://2.25.156.218:5001"
 RAZORPAY_API_URL     = "http://2.25.156.218:5000/check"
 RAZORPAY_API_KEY     = "Novaop"
