@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# app.py — NOVA · Sites + Proxies focused build (clean rewrite)
+# app.py — NOVA · Sites + Proxies (connectivity test + working buttons)
 
 import os, re, sys, json, time, html, random, threading, traceback, queue, socket, functools
 import requests, telebot, urllib3
@@ -17,9 +17,6 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════════
-# CORE IMPORTS
-# ═══════════════════════════════════════════════════════════════════
 from gates import check_shopify_api, process_shopify_api_response
 from complete_handler import (
     get_active_proxies,
@@ -31,22 +28,16 @@ from complete_handler import (
 )
 
 # ═══════════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════════
 BOT_TOKEN = "8533961422:AAGzOHNJEIeM7bsqb-qOW-fgErwgJ2jPV0U"
 OWNER_ID  = [5963548505, 5547897619]
 DARKS_ID  = 5963548505
-FREE_GROUP_ID  = -1003926435438
 REQUIRED_CHATS = ["@Nova_bot_update", "-1003926435438"]
 
 SITES_FILE        = "sites.json"
 PROXIES_FILE      = "proxies.json"
 USERS_FILE        = "users.json"
-GROUPS_FILE       = "groups.json"
 USER_PROXIES_FILE = "user_proxies.json"
 USER_SITES_FILE   = "user_sites.json"
-STATS_FILE        = "stats.json"
-SETTINGS_FILE     = "settings.json"
 
 SITE_VALIDATION_CCS = [
     "5242430428405662|03|28|323",
@@ -57,7 +48,7 @@ SITE_VALIDATION_CCS = [
 bot = telebot.TeleBot(BOT_TOKEN, num_threads=30)
 
 # ═══════════════════════════════════════════════════════════════════
-# MONGO + JSON HELPERS
+# MONGO + JSON
 # ═══════════════════════════════════════════════════════════════════
 uri = "mongodb+srv://Prince_Mine_pvt:Meandprincehitting@cluster0.blr8vex.mongodb.net/?appName=Cluster0"
 try:
@@ -68,12 +59,12 @@ try:
     db = _mc['nova_bot_db']
     logger.info("✅ MongoDB connected")
 except Exception as e:
-    logger.warning(f"❌ MongoDB failed: {e}")
+    logger.warning(f"❌ MongoDB: {e}")
     db = None
 
 
 def _coll(fp):
-    return fp.replace('.json', '').replace('data/', '').replace('/', '_')
+    return fp.replace('.json', '').replace('/', '_')
 
 
 def load_json(fp, default):
@@ -81,27 +72,27 @@ def load_json(fp, default):
         try:
             doc = db[_coll(fp)].find_one({"_id": "main_data"})
             if doc and 'data' in doc:
-                data = doc['data']
+                d = doc['data']
                 if fp == SITES_FILE:
-                    if isinstance(data, list): data = {"sites": data}
-                    data.setdefault('sites', [])
+                    if isinstance(d, list): d = {"sites": d}
+                    d.setdefault('sites', [])
                 elif fp == PROXIES_FILE:
-                    if isinstance(data, list): data = {"shopify": data, "razorpay": []}
-                    data.setdefault('shopify', []); data.setdefault('razorpay', [])
-                return data
+                    if isinstance(d, list): d = {"shopify": d, "razorpay": []}
+                    d.setdefault('shopify', []); d.setdefault('razorpay', [])
+                return d
         except Exception as e:
-            logger.warning(f"Mongo load {fp}: {e}")
+            logger.warning(f"Mongo load: {e}")
     try:
         if os.path.exists(fp):
             with open(fp, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+                d = json.load(f)
             if fp == SITES_FILE:
-                if isinstance(data, list): data = {"sites": data}
-                data.setdefault('sites', [])
+                if isinstance(d, list): d = {"sites": d}
+                d.setdefault('sites', [])
             elif fp == PROXIES_FILE:
-                if isinstance(data, list): data = {"shopify": data, "razorpay": []}
-                data.setdefault('shopify', []); data.setdefault('razorpay', [])
-            return data
+                if isinstance(d, list): d = {"shopify": d, "razorpay": []}
+                d.setdefault('shopify', []); d.setdefault('razorpay', [])
+            return d
     except Exception:
         pass
     return default
@@ -113,40 +104,29 @@ def save_json(fp, data):
             db[_coll(fp)].update_one(
                 {"_id": "main_data"},
                 {"$set": {"data": data, "updated_at": datetime.utcnow().isoformat()}},
-                upsert=True
-            )
+                upsert=True)
         except Exception as e:
-            logger.warning(f"Mongo save {fp}: {e}")
+            logger.warning(f"Mongo save: {e}")
     try:
         with open(fp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"Local save {fp}: {e}")
+        logger.error(f"Local save: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# LOAD DATA
 # ═══════════════════════════════════════════════════════════════════
 sites_data        = load_json(SITES_FILE, {"sites": []})
 proxies_data      = load_json(PROXIES_FILE, {"shopify": [], "razorpay": []})
 users_data        = load_json(USERS_FILE, {})
-groups_data       = load_json(GROUPS_FILE, {})
 user_proxies_data = load_json(USER_PROXIES_FILE, {})
 user_sites_data   = load_json(USER_SITES_FILE, {})
-stats_data        = load_json(STATS_FILE, {})
-settings_data     = load_json(SETTINGS_FILE, {"price_filter": None})
 
-# migrate + id assign
 _need = False
-_nid = 1
 for s in sites_data.get('sites', []):
     if 'id' not in s:
-        s['id'] = _nid
+        s['id'] = max((x.get('id', 0) for x in sites_data['sites']), default=0) + 1
         _need = True
-    if s['id'] >= _nid:
-        _nid = s['id'] + 1
-if _need:
-    save_json(SITES_FILE, sites_data)
+if _need: save_json(SITES_FILE, sites_data)
 
 _need = False
 for uid, e in user_proxies_data.items():
@@ -155,12 +135,10 @@ for uid, e in user_proxies_data.items():
         _need = True
     else:
         e.setdefault('shopify', []); e.setdefault('razorpay', [])
-if _need:
-    save_json(USER_PROXIES_FILE, user_proxies_data)
-
+if _need: save_json(USER_PROXIES_FILE, user_proxies_data)
 
 # ═══════════════════════════════════════════════════════════════════
-# SAFE SEND (rate-limited)
+# RATE LIMITER
 # ═══════════════════════════════════════════════════════════════════
 class _Limiter:
     def __init__(self, g=0.05, p=1.05, gr=3.0):
@@ -233,13 +211,11 @@ class _Limiter:
 
 
 _lim = _Limiter()
-
 def safe_send(fn, *a, **kw):
     return _lim.call(fn, *a, **kw)
 
-
 # ═══════════════════════════════════════════════════════════════════
-# ACK HELPER (never throws)
+# ACK + SAFE EDIT (the fix for silent button failures)
 # ═══════════════════════════════════════════════════════════════════
 def _ack(call, text=None, show_alert=False):
     try:
@@ -248,25 +224,76 @@ def _ack(call, text=None, show_alert=False):
         else:
             bot.answer_callback_query(call.id)
     except Exception as e:
-        logger.warning(f"ack failed: {e}")
+        logger.debug(f"ack: {e}")
+
+
+def _strip_style(kb_str):
+    """Remove style field from a keyboard JSON string."""
+    try:
+        kb = json.loads(kb_str) if isinstance(kb_str, str) else kb_str
+        for row in kb.get('inline_keyboard', []):
+            for btn in row:
+                btn.pop('style', None)
+        return json.dumps(kb)
+    except Exception:
+        return kb_str
+
+
+def _safe_edit(call, text, kb_str=None):
+    """
+    Try edit with markup. If fails, retry without style. If still fails, send new message.
+    Returns True if anything succeeded.
+    """
+    # 1) edit with markup (preserves colors if fork supports it)
+    try:
+        bot.edit_message_text(text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='HTML',
+            reply_markup=kb_str)
+        return True
+    except Exception as e1:
+        err = str(e1).lower()
+        if 'not modified' in err:
+            return True  # nothing changed, that's OK
+        logger.warning(f"edit#1 fail: {e1}")
+
+    # 2) edit with stripped-style markup
+    if kb_str:
+        try:
+            bot.edit_message_text(text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='HTML',
+                reply_markup=_strip_style(kb_str))
+            return True
+        except Exception as e2:
+            logger.warning(f"edit#2 fail: {e2}")
+
+    # 3) send NEW message
+    try:
+        bot.send_message(call.message.chat.id, text,
+            parse_mode='HTML', reply_markup=kb_str)
+        return True
+    except Exception as e3:
+        logger.warning(f"send#3 fail: {e3}")
+
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════
-# AUTH + FORCE SUB
+# AUTH
 # ═══════════════════════════════════════════════════════════════════
 def is_owner(uid):
     return uid in OWNER_ID
 
 
 def is_user_allowed(uid):
-    if uid in OWNER_ID:
-        return True
+    if uid in OWNER_ID: return True
     u = users_data.get(str(uid))
-    if not u:
-        return False
+    if not u: return False
     exp = u.get('expiry') or u.get('expiry_date')
-    if not exp:
-        return False
+    if not exp: return False
     try:
         return datetime.fromisoformat(exp) > datetime.now()
     except Exception:
@@ -274,8 +301,7 @@ def is_user_allowed(uid):
 
 
 def is_subscribed(uid):
-    if not REQUIRED_CHATS:
-        return True
+    if not REQUIRED_CHATS: return True
     for chat_id in REQUIRED_CHATS:
         try:
             m = bot.get_chat_member(chat_id, uid)
@@ -288,22 +314,48 @@ def is_subscribed(uid):
 
 def _sub_gate(message):
     uid = message.from_user.id
-    if uid in OWNER_ID:
-        return True
-    if is_subscribed(uid):
+    if uid in OWNER_ID or is_subscribed(uid):
         return True
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📢 Join Channel", url="https://t.me/Nova_bot_update"))
-    kb.add(types.InlineKeyboardButton("👥 Join Group", url="https://t.me/+NxKPx890ExkwYjQ0"))
-    kb.add(types.InlineKeyboardButton("🔄 I've Verified", callback_data="check_subscription"))
+    kb.add(types.InlineKeyboardButton("📢 Channel", url="https://t.me/Nova_bot_update"))
+    kb.add(types.InlineKeyboardButton("👥 Group", url="https://t.me/+NxKPx890ExkwYjQ0"))
+    kb.add(types.InlineKeyboardButton("🔄 Verified", callback_data="check_subscription"))
     safe_send(bot.reply_to, message,
-        "<b>🔒 ACCESS LOCKED</b>\n\n"
-        "Join both our channel and group to unlock the bot.\n\n"
-        "📢 <b>Channel</b> · @Nova_bot_update\n"
-        "👥 <b>Group</b> · <a href='https://t.me/+NxKPx890ExkwYjQ0'>tap to join</a>",
+        "<b>🔒 ACCESS LOCKED</b>\n\nJoin both to unlock.",
         parse_mode='HTML', reply_markup=kb)
     return False
 
+# ═══════════════════════════════════════════════════════════════════
+# PROXY CONNECTIVITY (the big fix — no sites needed)
+# ═══════════════════════════════════════════════════════════════════
+def test_proxy_connectivity(proxy, timeout=15):
+    """Pure connectivity — works even with 0 sites in pool."""
+    norm = normalize_proxy(proxy)
+    if not norm:
+        return False
+    parts = norm.split(':')
+    if len(parts) == 2:
+        url = f"http://{parts[0]}:{parts[1]}"
+    elif len(parts) == 4:
+        url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+    else:
+        return False
+    try:
+        r = requests.get(
+            "https://api.ipify.org?format=json",
+            proxies={"http": url, "https": url},
+            timeout=timeout, verify=False)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def test_proxy_deep(proxy, timeout=30):
+    """Full checkout test — requires valid sites in pool."""
+    sites = sites_data.get('sites', [])
+    if not sites:
+        return test_proxy_connectivity(proxy, timeout=timeout)
+    return test_proxy_for_shopify(proxy)
 
 # ═══════════════════════════════════════════════════════════════════
 # SITE HELPERS
@@ -325,12 +377,11 @@ def test_shopify_site(site_url, proxy=None, proxy_pool=None):
                 all_proxies=proxy_pool, all_sites=[site_url], max_attempts=1)
             if not api_resp or not isinstance(api_resp, dict):
                 continue
-            response_text, status, gateway = process_shopify_api_response(api_resp, '0.00')
-            up = response_text.upper()
-            if any(k in up for k in _SITE_REJECT):
+            rt, status, gw = process_shopify_api_response(api_resp, '0.00')
+            if any(k in rt.upper() for k in _SITE_REJECT):
                 continue
             if status in ('APPROVED', 'DECLINED', 'EXPIRED'):
-                return True, response_text[:80], gateway or 'Shopify Payments'
+                return True, rt[:80], gw or 'Shopify Payments'
         except Exception:
             continue
     return False, "no valid gateway response", None
@@ -354,8 +405,7 @@ def parse_site_urls(text):
 
 
 def get_next_site_id():
-    if not sites_data.get('sites'):
-        return 1
+    if not sites_data.get('sites'): return 1
     return max((s.get('id', 0) for s in sites_data['sites']), default=0) + 1
 
 
@@ -377,12 +427,6 @@ def add_site_to_global(url, gateway="Shopify Payments"):
 
 def get_user_sites(uid):
     return user_sites_data.get(str(uid), [])
-
-
-def save_user_site(uid, entry):
-    user_sites_data.setdefault(str(uid), []).append(entry)
-    save_json(USER_SITES_FILE, user_sites_data)
-
 
 # ═══════════════════════════════════════════════════════════════════
 # PROXY HELPERS
@@ -420,9 +464,8 @@ def parse_proxy_lines(text):
             seen.add(k); out.append((p, g))
     return out
 
-
 # ═══════════════════════════════════════════════════════════════════
-# SESSION FLAGS
+# SESSION
 # ═══════════════════════════════════════════════════════════════════
 user_sessions = {}
 
@@ -451,9 +494,8 @@ def _check_await(uid):
                 best, best_ts = k, ts
     return best
 
-
 # ═══════════════════════════════════════════════════════════════════
-# DOCUMENT UPLOAD ROUTER
+# DOCUMENT ROUTER
 # ═══════════════════════════════════════════════════════════════════
 @bot.message_handler(content_types=['document'])
 def on_document(message):
@@ -469,44 +511,64 @@ def on_document(message):
     _pop_await(uid, flag)
     fname = (message.document.file_name or '').lower()
     if not fname.endswith('.txt'):
-        safe_send(bot.reply_to, message, "❌ Please send a .txt file.")
+        safe_send(bot.reply_to, message, "❌ .txt only.")
         return
     try:
         info = bot.get_file(message.document.file_id)
         raw = bot.download_file(info.file_path).decode('utf-8', errors='ignore')
     except Exception as e:
-        safe_send(bot.reply_to, message, f"❌ Download failed: {e}")
+        safe_send(bot.reply_to, message, f"❌ Download: {e}")
         return
     if flag == 'awaiting_site_file':
         _run_site_validation(message, raw)
+    elif flag == 'awaiting_site_file_quick':
+        _run_site_quick_add(message, raw)
     elif flag == 'awaiting_proxy_file':
         _run_proxy_upload(message, raw)
     elif flag == 'awaiting_cards_file':
         _run_msh(message, raw)
 
+# ═══════════════════════════════════════════════════════════════════
+# SITE FLOWS
+# ═══════════════════════════════════════════════════════════════════
+def _run_site_quick_add(message, raw):
+    """Bulk add sites without testing."""
+    urls = parse_site_urls(raw)
+    if not urls:
+        safe_send(bot.reply_to, message, "❌ No URLs found.")
+        return
+    added, skipped = 0, 0
+    for u in urls:
+        if add_site_to_global(u):
+            added += 1
+        else:
+            skipped += 1
+    safe_send(bot.reply_to, message,
+        f"<b>✅ QUICK ADD DONE</b>\n\n"
+        f"Added: <b>{added}</b>\n"
+        f"Skipped dupes: <b>{skipped}</b>\n"
+        f"Total global: <b>{len(sites_data.get('sites', []))}</b>\n\n"
+        f"Use /cleansites or 🧹 Re-validate Pool to test them.",
+        parse_mode='HTML')
 
-# ═══════════════════════════════════════════════════════════════════
-# SITE VALIDATION
-# ═══════════════════════════════════════════════════════════════════
+
 def _run_site_validation(message, raw):
     uid = message.from_user.id
     urls = parse_site_urls(raw)
     if not urls:
-        safe_send(bot.reply_to, message, "❌ No URLs found.")
+        safe_send(bot.reply_to, message, "❌ No URLs.")
         return
     proxy_pool = []
     try:
         proxy_pool = get_active_proxies(uid, "shopify")
     except Exception:
         pass
-
     status = safe_send(bot.send_message, message.chat.id,
-        f"🧪 Testing <b>{len(urls)}</b> sites with 3 CCs each…\n"
+        f"🧪 Testing <b>{len(urls)}</b> sites (3 CCs each)…\n"
         f"🔌 Proxies: <b>{len(proxy_pool)}</b>",
         parse_mode='HTML')
     if not status:
         return
-
     tested, live, dead = 0, [], 0
     lock = threading.Lock()
     last_upd = time.time()
@@ -535,10 +597,8 @@ def _run_site_validation(message, raw):
                     last_upd = now
                 except Exception:
                     pass
-
     added = sum(1 for u, g in live if add_site_to_global(u, g))
     skipped = len(live) - added
-
     safe_send(bot.edit_message_text,
         f"<b>✅ VALIDATION DONE</b>\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -550,9 +610,8 @@ def _run_site_validation(message, raw):
         f"Total global: {len(sites_data.get('sites', []))}",
         message.chat.id, status.message_id, parse_mode='HTML')
 
-
 # ═══════════════════════════════════════════════════════════════════
-# PROXY UPLOAD
+# PROXY UPLOAD (CONNECTIVITY TEST — fixed)
 # ═══════════════════════════════════════════════════════════════════
 def _run_proxy_upload(message, raw):
     uid = message.from_user.id
@@ -561,30 +620,31 @@ def _run_proxy_upload(message, raw):
         safe_send(bot.reply_to, message, "❌ No valid proxies.")
         return
     status = safe_send(bot.send_message, message.chat.id,
-        f"🧪 Testing <b>{len(parsed)}</b> proxies…", parse_mode='HTML')
+        f"🧪 Testing connectivity of <b>{len(parsed)}</b> proxies…\n"
+        f"<i>(basic reachability — no sites needed)</i>",
+        parse_mode='HTML')
     if not status:
         return
-
     tested, live = 0, []
     lock = threading.Lock()
     last_upd = time.time()
 
     def _w(item):
         p, g = item
-        return p, g, (test_proxy_for_razorpay(p) if g == 'razorpay' else test_proxy_for_shopify(p))
+        return p, g, test_proxy_connectivity(p)
 
-    with ThreadPoolExecutor(max_workers=50) as ex:
-        futs = [ex.submit(_w, p) for p in parsed]
+    with ThreadPoolExecutor(max_workers=100) as ex:
+        futs = [ex.submit(_w, item) for item in parsed]
         for fut in as_completed(futs):
             tested += 1
             try:
-                p, g, ok = fut.result(timeout=90)
+                p, g, ok = fut.result(timeout=30)
             except Exception:
                 continue
             if ok:
                 with lock: live.append((p, g))
             now = time.time()
-            if now - last_upd >= 3:
+            if now - last_upd >= 2:
                 try:
                     safe_send(bot.edit_message_text,
                         f"🧪 {tested}/{len(parsed)} · ✅ {len(live)}",
@@ -592,13 +652,11 @@ def _run_proxy_upload(message, raw):
                     last_upd = now
                 except Exception:
                     pass
-
     data = read_user_proxies(uid)
     for p, g in live:
         if p not in data[g]:
             data[g].append(p)
     save_user_proxies_local(uid, data)
-
     safe_send(bot.edit_message_text,
         f"<b>✅ PROXY UPLOAD DONE</b>\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -608,9 +666,8 @@ def _run_proxy_upload(message, raw):
         f"Razorpay pool: {len(data['razorpay'])}",
         message.chat.id, status.message_id, parse_mode='HTML')
 
-
 # ═══════════════════════════════════════════════════════════════════
-# MSH FLOW
+# MSH
 # ═══════════════════════════════════════════════════════════════════
 def _run_msh(message, raw):
     uid = message.from_user.id
@@ -629,7 +686,7 @@ def _run_msh(message, raw):
         return
     sites = sites_data.get('sites', [])
     if not sites:
-        safe_send(bot.reply_to, message, "📭 No global sites.")
+        safe_send(bot.reply_to, message, "📭 No global sites — use /addurls first.")
         return
     proxies = get_active_proxies(uid, 'shopify') or []
     start = bot.reply_to(message, f"📦 Starting on {len(ccs)} cards…")
@@ -637,15 +694,13 @@ def _run_msh(message, raw):
         process_shopify_mass_check(
             bot, message, start, ccs, sites, proxies,
             uid, load_json, save_json, USERS_FILE,
-            hit_pref="both", dm_target_user_id=None,
-        )
+            hit_pref="both", dm_target_user_id=None)
     except Exception as e:
         logger.error(f"msh: {traceback.format_exc()}")
-        safe_send(bot.send_message, message.chat.id, f"❌ Error: {e}")
-
+        safe_send(bot.send_message, message.chat.id, f"❌ {e}")
 
 # ═══════════════════════════════════════════════════════════════════
-# KEYBOARD BUILDERS
+# KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════
 def cbtn(text, data=None, url=None, style=None):
     b = {"text": text}
@@ -654,9 +709,9 @@ def cbtn(text, data=None, url=None, style=None):
     if style in ("primary", "success", "danger"): b["style"] = style
     return b
 
+
 def ckb(*rows):
     return json.dumps({"inline_keyboard": [list(r) for r in rows]})
-
 
 # ═══════════════════════════════════════════════════════════════════
 # START
@@ -664,14 +719,12 @@ def ckb(*rows):
 def _start_text(uid, name):
     tier = "owner" if uid in OWNER_ID else ("premium" if is_user_allowed(uid) else "free")
     tline = {"owner": "👑 Owner", "premium": "💎 Premium", "free": "🆓 Free"}[tier]
-    sh = len(sites_data.get('sites', []))
     up = read_user_proxies(uid)
     return (
-        f"<b>⚡ N O V A · C H E C K E R</b>\n"
-        f"<i>sites. proxies. clean.</i>\n\n"
+        f"<b>⚡ N O V A · C H E C K E R</b>\n\n"
         f"👋 <b>{html.escape(name or 'User')}</b>\n"
         f"{tline}\n\n"
-        f"🌐 Global sites: <b>{sh}</b>\n"
+        f"🌐 Global sites: <b>{len(sites_data.get('sites', []))}</b>\n"
         f"🛡️ Shopify proxies: <b>{len(up['shopify'])}</b>\n"
         f"💎 Razorpay proxies: <b>{len(up['razorpay'])}</b>\n\n"
         f"<i>⚡ NOVA · <a href='tg://user?id={DARKS_ID}'>Unknownop</a></i>"
@@ -680,9 +733,9 @@ def _start_text(uid, name):
 
 def _start_kb(uid):
     rows = [
-        [cbtn("🌐 Site Manager",   "menu_sites", style="success"),
+        [cbtn("🌐 Site Manager", "menu_sites", style="success"),
          cbtn("🛡️ Proxy Manager", "menu_proxy", style="primary")],
-        [cbtn("📦 Shopify Mass",   "menu_msh")],
+        [cbtn("📦 Shopify Mass", "menu_msh")],
     ]
     if is_owner(uid):
         rows.append([cbtn("👑 Owner Panel", "own_root", style="danger")])
@@ -701,32 +754,21 @@ def cmd_start(message):
 @bot.callback_query_handler(func=lambda c: c.data == "back_to_start")
 def cb_back_start(call):
     _ack(call)
-    try:
-        bot.edit_message_text(
-            _start_text(call.from_user.id, call.from_user.first_name),
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=_start_kb(call.from_user.id))
-    except Exception as e:
-        logger.warning(f"back_to_start edit: {e}")
+    _safe_edit(call, _start_text(call.from_user.id, call.from_user.first_name),
+               _start_kb(call.from_user.id))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "check_subscription")
 def cb_check_sub(call):
     if is_subscribed(call.from_user.id) or call.from_user.id in OWNER_ID:
         _ack(call, "✅ Access granted!")
-        try:
-            bot.edit_message_text(
-                _start_text(call.from_user.id, call.from_user.first_name),
-                chat_id=call.message.chat.id, message_id=call.message.message_id,
-                parse_mode='HTML', reply_markup=_start_kb(call.from_user.id))
-        except Exception:
-            pass
+        _safe_edit(call, _start_text(call.from_user.id, call.from_user.first_name),
+                   _start_kb(call.from_user.id))
     else:
-        _ack(call, "❌ Not yet — join both.", show_alert=True)
-
+        _ack(call, "❌ Join both first.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════════
-# SITE MANAGER
+# SITE MENUS
 # ═══════════════════════════════════════════════════════════════════
 @bot.callback_query_handler(func=lambda c: c.data == "menu_sites")
 def cb_menu_sites(call):
@@ -735,29 +777,22 @@ def cb_menu_sites(call):
     mine = len(get_user_sites(call.from_user.id))
     rows = [
         [cbtn("🌐 Global Sites", "site_list_global", style="success"),
-         cbtn("🏠 My Sites",     "site_list_mine",   style="success")],
+         cbtn("🏠 My Sites", "site_list_mine", style="success")],
     ]
     if is_owner(call.from_user.id):
+        rows.append([cbtn("➕ Add URLs (quick)", "site_quick_prompt", style="primary")])
         rows.append([cbtn("🧪 Validate New", "site_validate_prompt", style="danger")])
         rows.append([cbtn("🧹 Re-validate Pool", "site_clean_global", style="danger")])
     rows.append([cbtn("🔙 Back", "back_to_start", style="danger")])
-
     text = (
         f"<b>🌐 SITE MANAGER</b>\n\n"
         f"Global: <b>{sh}</b> sites\n"
         f"Personal: <b>{mine}</b> sites\n\n"
-        "🌐 <b>Global</b> — shared pool\n"
-        "🏠 <b>Mine</b> — your own\n\n"
+        f"➕ <b>Add URLs</b> — paste/upload, no testing\n"
+        f"🧪 <b>Validate</b> — add with 3-CC test\n"
+        f"🧹 <b>Re-validate</b> — retest pool"
     )
-    if is_owner(call.from_user.id):
-        text += "🧪 <b>Validate</b> — add URLs (3-CC test)\n"
-        text += "🧹 <b>Re-validate</b> — retest pool"
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-            message_id=call.message.message_id, parse_mode='HTML',
-            reply_markup=ckb(*rows))
-    except Exception as e:
-        logger.warning(f"menu_sites edit: {e}")
+    _safe_edit(call, text, ckb(*rows))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "site_list_global")
@@ -769,22 +804,15 @@ def cb_site_list_global(call):
     else:
         lines = []
         for s in sites[:40]:
-            sid = s.get('id', '?')
-            u = html.escape(s.get('url', ''))
-            lines.append(f"#{sid}  {u}")
+            lines.append(f"#{s.get('id', '?')}  {html.escape(s.get('url', ''))}")
         body = "\n".join(lines)
         if len(sites) > 40:
-            body += f"\n… and {len(sites)-40} more"
+            body += f"\n… and {len(sites) - 40} more"
     text = f"<b>🌐 GLOBAL ({len(sites)})</b>\n\n{body}"
     kb = ckb(
         [cbtn("📋 Full List", "site_full_list", style="primary")],
-        [cbtn("🔙 Back", "menu_sites", style="danger")],
-    )
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-            message_id=call.message.message_id, parse_mode='HTML', reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"site_list_global edit: {e}")
+        [cbtn("🔙 Back", "menu_sites", style="danger")])
+    _safe_edit(call, text, kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "site_list_mine")
@@ -794,25 +822,14 @@ def cb_site_list_mine(call):
     if not mine:
         body = "<i>None yet.</i>"
     else:
-        lines = []
-        for s in mine:
-            sid = s.get('id', '?')
-            u = html.escape(s.get('url', ''))
-            lines.append(f"#{sid}  {u}")
-        body = "\n".join(lines)
+        body = "\n".join(f"#{s.get('id','?')}  {html.escape(s.get('url', ''))}" for s in mine)
     text = (
         f"<b>🏠 MY SITES ({len(mine)})</b>\n\n{body}\n\n"
         f"Add: <code>/addmysite https://site.com</code>"
     )
     kb = ckb(
-        [cbtn("➕ Add Site", "site_add_prompt", style="success")],
-        [cbtn("🔙 Back", "menu_sites", style="danger")],
-    )
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-            message_id=call.message.message_id, parse_mode='HTML', reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"site_list_mine edit: {e}")
+        [cbtn("🔙 Back", "menu_sites", style="danger")])
+    _safe_edit(call, text, kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "site_full_list")
@@ -835,6 +852,22 @@ def cb_site_full_list(call):
         logger.warning(f"site_full_list: {e}")
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "site_quick_prompt")
+def cb_site_quick_prompt(call):
+    if not is_owner(call.from_user.id):
+        _ack(call, "🚫 Owner only.", show_alert=True)
+        return
+    _ack(call)
+    _set_await(call.from_user.id, 'awaiting_site_file_quick')
+    _safe_edit(call,
+        "<b>➕ ADD URLs (quick)</b>\n\n"
+        "Send a <b>.txt</b> of URLs — one per line.\n"
+        "No testing — straight into global pool.\n\n"
+        "Or type: <code>/addurls url1 url2 ...</code>\n\n"
+        "Use /cleansites later to filter dead ones.",
+        ckb([cbtn("🔙 Cancel", "menu_sites", style="danger")]))
+
+
 @bot.callback_query_handler(func=lambda c: c.data == "site_validate_prompt")
 def cb_site_validate_prompt(call):
     if not is_owner(call.from_user.id):
@@ -842,16 +875,11 @@ def cb_site_validate_prompt(call):
         return
     _ack(call)
     _set_await(call.from_user.id, 'awaiting_site_file')
-    try:
-        bot.edit_message_text(
-            "<b>🧪 VALIDATE NEW SITES</b>\n\n"
-            "Send a <b>.txt</b> file — one URL per line.\n\n"
-            "Each site tested with <b>3 CCs</b>. Only valid ones added.",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=ckb([cbtn("🔙 Cancel", "menu_sites", style="danger")]))
-    except Exception as e:
-        logger.warning(f"site_validate_prompt: {e}")
+    _safe_edit(call,
+        "<b>🧪 VALIDATE NEW SITES</b>\n\n"
+        "Send a <b>.txt</b> of URLs — one per line.\n"
+        "Each tested with <b>3 CCs</b>. Only valid ones added.",
+        ckb([cbtn("🔙 Cancel", "menu_sites", style="danger")]))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "site_clean_global")
@@ -867,8 +895,6 @@ def cb_site_clean_global(call):
         return
     status = bot.send_message(call.message.chat.id,
         f"🧹 Re-testing <b>{len(sites)}</b> sites…", parse_mode='HTML')
-    if not status:
-        return
     proxy_pool = []
     try:
         proxy_pool = get_active_proxies(call.from_user.id, "shopify")
@@ -902,10 +928,8 @@ def cb_site_clean_global(call):
                     last_upd = now
                 except Exception:
                     pass
-
     sites_data['sites'] = keep
     save_json(SITES_FILE, sites_data)
-
     safe_send(bot.edit_message_text,
         f"<b>🧹 CLEANED</b>\n\n✅ Kept: {len(keep)}\n🗑️ Dropped: {drop}",
         call.message.chat.id, status.message_id, parse_mode='HTML')
@@ -914,20 +938,13 @@ def cb_site_clean_global(call):
 @bot.callback_query_handler(func=lambda c: c.data == "site_add_prompt")
 def cb_site_add_prompt(call):
     _ack(call)
-    try:
-        bot.edit_message_text(
-            "<b>➕ ADD PERSONAL SITE</b>\n\n"
-            "Type in chat:\n"
-            "<code>/addmysite https://site.com</code>",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=ckb([cbtn("🔙 Back", "menu_sites", style="danger")]))
-    except Exception as e:
-        logger.warning(f"site_add_prompt: {e}")
-
+    _safe_edit(call,
+        "<b>➕ ADD PERSONAL SITE</b>\n\n"
+        "Type in chat:\n<code>/addmysite https://site.com</code>",
+        ckb([cbtn("🔙 Back", "menu_sites", style="danger")]))
 
 # ═══════════════════════════════════════════════════════════════════
-# PROXY MANAGER
+# PROXY MENUS
 # ═══════════════════════════════════════════════════════════════════
 @bot.callback_query_handler(func=lambda c: c.data == "menu_proxy")
 def cb_menu_proxy(call):
@@ -937,60 +954,45 @@ def cb_menu_proxy(call):
         f"<b>🛡️ PROXY MANAGER</b>\n\n"
         f"Shopify pool: <b>{len(up['shopify'])}</b>\n"
         f"Razorpay pool: <b>{len(up['razorpay'])}</b>\n\n"
-        "🛍️ Shopify — used by /sh, /msh\n"
-        "💎 Razorpay — used by /rz, /mrz"
+        f"🛍️ Shopify — used by /sh, /msh\n"
+        f"💎 Razorpay — used by /rz, /mrz"
     )
     kb = ckb(
-        [cbtn("➕ Add Proxy",   "proxy_add_prompt",    style="success"),
+        [cbtn("➕ Add Proxy", "proxy_add_prompt", style="success"),
          cbtn("📂 Upload .txt", "proxy_upload_prompt", style="success")],
         [cbtn("📋 View Proxies", "proxy_view")],
-        [cbtn("🧹 Clean Dead",   "proxy_clean",         style="primary")],
-        [cbtn("🗑️ Clear All",    "clearproxies_prompt", style="danger")],
-        [cbtn("🔙 Back",         "back_to_start",       style="danger")],
-    )
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-            message_id=call.message.message_id, parse_mode='HTML', reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"menu_proxy edit: {e}")
+        [cbtn("🧹 Clean Dead", "proxy_clean", style="primary")],
+        [cbtn("🗑️ Clear All", "clearproxies_prompt", style="danger")],
+        [cbtn("🔙 Back", "back_to_start", style="danger")])
+    _safe_edit(call, text, kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "proxy_add_prompt")
 def cb_proxy_add_prompt(call):
     _ack(call)
-    try:
-        bot.edit_message_text(
-            "<b>➕ ADD A PROXY</b>\n\n"
-            "Type in chat:\n"
-            "<code>/addpro ip:port</code>\n"
-            "<code>/addpro ip:port:user:pass</code>\n\n"
-            "Optional gate suffix:\n"
-            "<code>/addpro ip:port:user:pass shopify</code>\n"
-            "<code>/addpro ip:port:user:pass razorpay</code>",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=ckb([cbtn("🔙 Back", "menu_proxy", style="danger")]))
-    except Exception as e:
-        logger.warning(f"proxy_add_prompt: {e}")
+    _safe_edit(call,
+        "<b>➕ ADD A PROXY</b>\n\n"
+        "Type in chat:\n"
+        "<code>/addpro ip:port</code>\n"
+        "<code>/addpro ip:port:user:pass</code>\n\n"
+        "Optional gate:\n"
+        "<code>/addpro ip:port:user:pass shopify</code>\n"
+        "<code>/addpro ip:port:user:pass razorpay</code>",
+        ckb([cbtn("🔙 Back", "menu_proxy", style="danger")]))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "proxy_upload_prompt")
 def cb_proxy_upload_prompt(call):
     _ack(call)
     _set_await(call.from_user.id, 'awaiting_proxy_file')
-    try:
-        bot.edit_message_text(
-            "<b>📂 UPLOAD PROXIES</b>\n\n"
-            "Send a <b>.txt</b> file — one per line:\n"
-            "<code>ip:port</code>\n"
-            "<code>ip:port:user:pass</code>\n\n"
-            "Optional per line: <code> shopify</code> or <code> razorpay</code>\n"
-            "Only live proxies saved.",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=ckb([cbtn("🔙 Cancel", "menu_proxy", style="danger")]))
-    except Exception as e:
-        logger.warning(f"proxy_upload_prompt: {e}")
+    _safe_edit(call,
+        "<b>📂 UPLOAD PROXIES</b>\n\n"
+        "Send a <b>.txt</b> — one per line:\n"
+        "<code>ip:port</code>\n"
+        "<code>ip:port:user:pass</code>\n\n"
+        "Optional: <code> shopify</code> or <code> razorpay</code>\n"
+        "Only reachable proxies saved.",
+        ckb([cbtn("🔙 Cancel", "menu_proxy", style="danger")]))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "proxy_view")
@@ -999,11 +1001,10 @@ def cb_proxy_view(call):
     up = read_user_proxies(call.from_user.id)
 
     def fmt(lst, cap=15):
-        if not lst:
-            return "  (empty)"
+        if not lst: return "  (empty)"
         out = "\n".join(f"  {p}" for p in lst[:cap])
         if len(lst) > cap:
-            out += f"\n  … and {len(lst)-cap} more"
+            out += f"\n  … and {len(lst) - cap} more"
         return out
 
     text = (
@@ -1012,19 +1013,10 @@ def cb_proxy_view(call):
         f"💎 <b>Razorpay</b> · {len(up['razorpay'])}\n{fmt(up['razorpay'])}"
     )
     kb = ckb(
-        [cbtn("🧹 Clean Dead", "proxy_clean",         style="primary")],
-        [cbtn("🗑️ Clear All",  "clearproxies_prompt", style="danger")],
-        [cbtn("🔙 Back",       "menu_proxy",          style="danger")],
-    )
-    try:
-        bot.edit_message_text(text, chat_id=call.message.chat.id,
-            message_id=call.message.message_id, parse_mode='HTML', reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"proxy_view edit: {e}")
-        try:
-            bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=kb)
-        except Exception:
-            pass
+        [cbtn("🧹 Clean Dead", "proxy_clean", style="primary")],
+        [cbtn("🗑️ Clear All", "clearproxies_prompt", style="danger")],
+        [cbtn("🔙 Back", "menu_proxy", style="danger")])
+    _safe_edit(call, text, kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "proxy_clean")
@@ -1034,35 +1026,29 @@ def cb_proxy_clean(call):
     up = read_user_proxies(uid)
     all_p = list(dict.fromkeys(up['shopify'] + up['razorpay']))
     if not all_p:
-        try:
-            bot.edit_message_text("📭 No proxies.",
-                chat_id=call.message.chat.id, message_id=call.message.message_id)
-        except Exception:
-            pass
+        _safe_edit(call, "📭 No proxies.", None)
         return
     status = bot.send_message(call.message.chat.id,
         f"🧹 Testing <b>{len(all_p)}</b> proxies…", parse_mode='HTML')
-    if not status:
-        return
     tested, live = 0, []
     lock = threading.Lock()
     last_upd = time.time()
 
     def _w(p):
-        return p, test_proxy_for_shopify(p)
+        return p, test_proxy_connectivity(p)
 
-    with ThreadPoolExecutor(max_workers=50) as ex:
+    with ThreadPoolExecutor(max_workers=100) as ex:
         futs = [ex.submit(_w, p) for p in all_p]
         for fut in as_completed(futs):
             tested += 1
             try:
-                p, ok = fut.result(timeout=90)
+                p, ok = fut.result(timeout=30)
             except Exception:
                 continue
             if ok:
                 with lock: live.append(p)
             now = time.time()
-            if now - last_upd >= 3:
+            if now - last_upd >= 2:
                 try:
                     safe_send(bot.edit_message_text,
                         f"🧹 {tested}/{len(all_p)} · ✅ {len(live)}",
@@ -1070,11 +1056,9 @@ def cb_proxy_clean(call):
                     last_upd = now
                 except Exception:
                     pass
-
     up['shopify'] = live
     up['razorpay'] = []
     save_user_proxies_local(uid, up)
-
     safe_send(bot.edit_message_text,
         f"<b>✅ CLEANED</b>\n\nLive: {len(live)} / {len(all_p)}",
         call.message.chat.id, status.message_id, parse_mode='HTML')
@@ -1085,16 +1069,10 @@ def cb_clearproxies_prompt(call):
     _ack(call)
     kb = ckb(
         [cbtn("⚠️ Yes, wipe both", "clearproxies_confirm", style="danger")],
-        [cbtn("❌ Cancel", "menu_proxy", style="success")],
-    )
-    try:
-        bot.edit_message_text(
-            "<b>⚠️ CONFIRM WIPE</b>\n\n"
-            "This deletes ALL your proxies. Cannot be undone.",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"clearproxies_prompt: {e}")
+        [cbtn("❌ Cancel", "menu_proxy", style="success")])
+    _safe_edit(call,
+        "<b>⚠️ CONFIRM WIPE</b>\n\nDeletes ALL proxies. Cannot be undone.",
+        kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "clearproxies_confirm")
@@ -1103,15 +1081,9 @@ def cb_clearproxies_confirm(call):
     uid = str(call.from_user.id)
     user_proxies_data[uid] = {"shopify": [], "razorpay": []}
     save_json(USER_PROXIES_FILE, user_proxies_data)
-    try:
-        bot.edit_message_text(
-            "<b>✅ PROXIES CLEARED</b>\n\nBoth pools empty.",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=ckb([cbtn("🔙 Proxy Menu", "menu_proxy", style="success")]))
-    except Exception as e:
-        logger.warning(f"clearproxies_confirm: {e}")
-
+    _safe_edit(call,
+        "<b>✅ PROXIES CLEARED</b>\n\nBoth pools empty.",
+        ckb([cbtn("🔙 Proxy Menu", "menu_proxy", style="success")]))
 
 # ═══════════════════════════════════════════════════════════════════
 # MSH INFO
@@ -1119,19 +1091,13 @@ def cb_clearproxies_confirm(call):
 @bot.callback_query_handler(func=lambda c: c.data == "menu_msh")
 def cb_menu_msh(call):
     _ack(call)
-    try:
-        bot.edit_message_text(
-            "<b>📦 SHOPIFY MASS CHECK</b>\n\n"
-            "Upload a <b>.txt</b> of cards → one per line →\n"
-            "bot checks against global sites + your proxies.\n\n"
-            "Command: <code>/msh</code>\n"
-            "Format: <code>CC|MM|YYYY|CVV</code>",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=ckb([cbtn("🔙 Back", "back_to_start", style="danger")]))
-    except Exception as e:
-        logger.warning(f"menu_msh: {e}")
-
+    _safe_edit(call,
+        "<b>📦 SHOPIFY MASS CHECK</b>\n\n"
+        "Upload a <b>.txt</b> of cards → one per line →\n"
+        "bot checks against global sites + your proxies.\n\n"
+        "Command: <code>/msh</code>\n"
+        "Format: <code>CC|MM|YYYY|CVV</code>",
+        ckb([cbtn("🔙 Back", "back_to_start", style="danger")]))
 
 # ═══════════════════════════════════════════════════════════════════
 # OWNER PANEL
@@ -1143,25 +1109,46 @@ def cb_own_root(call):
         return
     _ack(call)
     kb = ckb(
-        [cbtn("🌐 Sites",          "menu_sites",           style="success"),
-         cbtn("🛡️ Proxies",        "menu_proxy",           style="success")],
-        [cbtn("🧪 Validate Sites", "site_validate_prompt", style="danger"),
-         cbtn("🧹 Clean Pool",     "site_clean_global",    style="danger")],
-        [cbtn("🔙 Back",           "back_to_start",        style="danger")],
-    )
-    try:
-        bot.edit_message_text(
-            f"<b>👑 OWNER PANEL</b>\n\n"
-            f"🌐 Global sites: <b>{len(sites_data.get('sites', []))}</b>",
-            chat_id=call.message.chat.id, message_id=call.message.message_id,
-            parse_mode='HTML', reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"own_root: {e}")
-
+        [cbtn("🌐 Sites", "menu_sites", style="success"),
+         cbtn("🛡️ Proxies", "menu_proxy", style="success")],
+        [cbtn("➕ Add URLs", "site_quick_prompt", style="primary"),
+         cbtn("🧪 Validate", "site_validate_prompt", style="danger")],
+        [cbtn("🧹 Clean Pool", "site_clean_global", style="danger"),
+         cbtn("🔙 Back", "back_to_start", style="danger")])
+    _safe_edit(call,
+        f"<b>👑 OWNER PANEL</b>\n\n"
+        f"🌐 Global sites: <b>{len(sites_data.get('sites', []))}</b>",
+        kb)
 
 # ═══════════════════════════════════════════════════════════════════
 # TEXT COMMANDS
 # ═══════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=['addurls'])
+def cmd_addurls(message):
+    if not is_owner(message.from_user.id):
+        safe_send(bot.reply_to, message, "🚫 Owner only.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) >= 2 and 'http' in parts[1]:
+        urls = parse_site_urls(parts[1])
+        added, skipped = 0, 0
+        for u in urls:
+            if add_site_to_global(u): added += 1
+            else: skipped += 1
+        safe_send(bot.reply_to, message,
+            f"✅ Added: {added}\n⏭️ Skipped: {skipped}\n"
+            f"🌐 Total: {len(sites_data.get('sites', []))}",
+            parse_mode='HTML')
+        return
+    _set_await(message.from_user.id, 'awaiting_site_file_quick')
+    safe_send(bot.reply_to, message,
+        "<b>📂 ADD URLS</b>\n\n"
+        "Send a <b>.txt</b> of URLs — one per line.\n"
+        "No testing — goes straight into global pool.\n\n"
+        "Or use: <code>/addurls url1 url2</code>",
+        parse_mode='HTML')
+
+
 @bot.message_handler(commands=['validatesites'])
 def cmd_validatesites(message):
     if not is_owner(message.from_user.id):
@@ -1170,8 +1157,7 @@ def cmd_validatesites(message):
     _set_await(message.from_user.id, 'awaiting_site_file')
     safe_send(bot.reply_to, message,
         "<b>🧪 VALIDATE SITES</b>\n\n"
-        "Send a <b>.txt</b> file — one URL per line.\n"
-        "Each site tested with 3 CCs.",
+        "Send a <b>.txt</b> of URLs — 3-CC test on each.",
         parse_mode='HTML')
 
 
@@ -1195,8 +1181,50 @@ def cmd_listsites(message):
             with open(fname, 'rb') as f:
                 bot.send_document(message.chat.id, f, caption=f"🌐 {len(sites)} sites")
             os.remove(fname)
-        except Exception as e:
-            logger.warning(f"listsites: {e}")
+        except Exception:
+            pass
+
+
+@bot.message_handler(commands=['cleansites'])
+def cmd_cleansites(message):
+    global sites_data
+    if not is_owner(message.from_user.id):
+        safe_send(bot.reply_to, message, "🚫 Owner only.")
+        return
+    sites = sites_data.get('sites', [])
+    if not sites:
+        safe_send(bot.reply_to, message, "📭 No sites.")
+        return
+    status = bot.reply_to(message, f"🧹 Testing {len(sites)} sites…")
+    proxy_pool = get_active_proxies(message.from_user.id, "shopify")
+    tested, keep, drop = 0, [], 0
+
+    def _w(s):
+        proxy = random.choice(proxy_pool) if proxy_pool else None
+        return s, test_shopify_site(s['url'], proxy=proxy, proxy_pool=proxy_pool)
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(_w, s) for s in sites]
+        for fut in as_completed(futs):
+            tested += 1
+            try:
+                s, (ok, _r, _g) = fut.result(timeout=120)
+            except Exception:
+                continue
+            if ok: keep.append(s)
+            else: drop += 1
+            if tested % 5 == 0:
+                try:
+                    safe_send(bot.edit_message_text,
+                        f"🧹 {tested}/{len(sites)} · ✅ {len(keep)} · 🗑️ {drop}",
+                        message.chat.id, status.message_id)
+                except Exception:
+                    pass
+    sites_data['sites'] = keep
+    save_json(SITES_FILE, sites_data)
+    safe_send(bot.edit_message_text,
+        f"✅ Kept: {len(keep)}\n🗑️ Dropped: {drop}",
+        message.chat.id, status.message_id)
 
 
 @bot.message_handler(commands=['rmsite'])
@@ -1207,7 +1235,7 @@ def cmd_rmsite(message):
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        safe_send(bot.reply_to, message, "Usage: /rmsite <id>", parse_mode='HTML')
+        safe_send(bot.reply_to, message, "Usage: /rmsite <id>")
         return
     try:
         sid = int(parts[1].strip().lstrip('#'))
@@ -1220,44 +1248,41 @@ def cmd_rmsite(message):
         safe_send(bot.reply_to, message, f"❌ No site #{sid}.")
         return
     save_json(SITES_FILE, sites_data)
-    safe_send(bot.reply_to, message, f"✅ Removed #{sid}. Remaining: {len(sites_data['sites'])}")
+    safe_send(bot.reply_to, message,
+        f"✅ Removed #{sid}. Remaining: {len(sites_data['sites'])}")
 
 
 @bot.message_handler(commands=['addmysite'])
 def cmd_addmysite(message):
     if not _sub_gate(message):
         return
-    if not is_user_allowed(message.from_user.id) and not is_owner(message.from_user.id):
-        safe_send(bot.reply_to, message, "🚫 Premium required.")
-        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        safe_send(bot.reply_to, message, "Usage: /addmysite <url>", parse_mode='HTML')
+        safe_send(bot.reply_to, message, "Usage: /addmysite <url>")
         return
     url = parts[1].strip().rstrip('/')
     if not url.startswith('https://'):
-        safe_send(bot.reply_to, message, "❌ URL must start with https://")
+        safe_send(bot.reply_to, message, "❌ Must start with https://")
         return
     uid = message.from_user.id
     mine = get_user_sites(uid)
     nid = max((s.get('id', 0) for s in mine), default=0) + 1
-    save_user_site(uid, {
+    user_sites_data.setdefault(str(uid), []).append({
         "url": url,
         "name": url.replace('https://', '').split('/')[0],
         "price": "0.00",
         "gateway": "Shopify Payments",
-        "id": nid,
-    })
-    safe_send(bot.reply_to, message,
-        f"✅ Added: <code>{html.escape(url)}</code>", parse_mode='HTML')
+        "id": nid})
+    save_json(USER_SITES_FILE, user_sites_data)
+    safe_send(bot.reply_to, message, f"✅ Added: <code>{html.escape(url)}</code>",
+              parse_mode='HTML')
 
 
 @bot.message_handler(commands=['mysites'])
 def cmd_mysites(message):
     mine = get_user_sites(message.from_user.id)
     if not mine:
-        safe_send(bot.reply_to, message,
-            "📭 No personal sites.\nAdd: /addmysite <url>", parse_mode='HTML')
+        safe_send(bot.reply_to, message, "📭 None. Add: /addmysite <url>")
         return
     lines = "\n".join(f"{i}. [#{s.get('id','?')}] {s.get('url','')}"
                       for i, s in enumerate(mine, 1))
@@ -1275,43 +1300,38 @@ def cmd_addpro(message):
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        # No proxy given → start file upload flow
         _set_await(message.from_user.id, 'awaiting_proxy_file')
         safe_send(bot.reply_to, message,
             "<b>📂 ADD PROXIES</b>\n\n"
-            "Send a <b>.txt</b> file — one per line:\n"
-            "<code>ip:port</code>\n"
-            "<code>ip:port:user:pass</code>\n\n"
-            "Or inline:\n"
-            "<code>/addpro ip:port:user:pass</code>",
+            "Send a <b>.txt</b> — one per line:\n"
+            "<code>ip:port</code>\n<code>ip:port:user:pass</code>\n\n"
+            "Or inline: <code>/addpro ip:port:user:pass</code>",
             parse_mode='HTML')
         return
     raw = parts[1].strip()
     gate = "shopify"
     tokens = raw.split()
     if len(tokens) >= 2 and tokens[-1].lower() in ('shopify', 'razorpay'):
-        gate = tokens[-1].lower()
-        raw = " ".join(tokens[:-1])
+        gate = tokens[-1].lower(); raw = " ".join(tokens[:-1])
     norm = normalize_proxy(raw)
     if not norm:
-        safe_send(bot.reply_to, message, "❌ Invalid proxy format.")
+        safe_send(bot.reply_to, message, "❌ Invalid format.")
         return
-    if not _quick_alive(norm, timeout=8):
+    if not test_proxy_connectivity(norm):
         safe_send(bot.reply_to, message,
-            f"❌ Proxy dead: <code>{html.escape(norm)}</code>", parse_mode='HTML')
+            f"❌ Dead: <code>{html.escape(norm)}</code>", parse_mode='HTML')
         return
     uid = message.from_user.id
     up = read_user_proxies(uid)
     if norm in up[gate]:
         safe_send(bot.reply_to, message,
-            f"⚠️ Already in {gate}:\n<code>{html.escape(norm)}</code>",
-            parse_mode='HTML')
+            f"⚠️ Already in {gate}", parse_mode='HTML')
         return
     up[gate].append(norm)
     save_user_proxies_local(uid, up)
     safe_send(bot.reply_to, message,
-        f"✅ Added to <b>{gate}</b>:\n<code>{html.escape(norm)}</code>\n\n"
-        f"Pool size: <b>{len(up[gate])}</b>",
+        f"✅ Added to <b>{gate}</b>\n<code>{html.escape(norm)}</code>\n"
+        f"Pool: <b>{len(up[gate])}</b>",
         parse_mode='HTML')
 
 
@@ -1319,14 +1339,9 @@ def cmd_addpro(message):
 def cmd_uploadproxies(message):
     if not _sub_gate(message):
         return
-    if not is_user_allowed(message.from_user.id) and not is_owner(message.from_user.id):
-        safe_send(bot.reply_to, message, "🚫 Premium required.")
-        return
     _set_await(message.from_user.id, 'awaiting_proxy_file')
     safe_send(bot.reply_to, message,
-        "<b>📂 Send proxy .txt now.</b>\n\nOne per line:\n"
-        "<code>ip:port</code>\n<code>ip:port:user:pass</code>\n"
-        "Optional: <code> shopify</code> or <code> razorpay</code>",
+        "<b>📂 Send proxy .txt</b>\n\nOne per line: <code>ip:port:user:pass</code>",
         parse_mode='HTML')
 
 
@@ -1346,34 +1361,32 @@ def cmd_clearproxies(message):
 def cmd_cleanshpro(message):
     if not _sub_gate(message):
         return
-    if not is_user_allowed(message.from_user.id) and not is_owner(message.from_user.id):
-        safe_send(bot.reply_to, message, "🚫 Premium required.")
-        return
     uid = message.from_user.id
     up = read_user_proxies(uid)
     all_p = up['shopify']
     if not all_p:
         safe_send(bot.reply_to, message, "📭 No proxies.")
         return
-    status = bot.reply_to(message, f"🧹 Testing {len(all_p)}…")
+    has_sites = len(sites_data.get('sites', [])) > 0
+    mode = "deep (with sites)" if has_sites else "connectivity only"
+    status = bot.reply_to(message, f"🧹 Testing {len(all_p)} — {mode}…")
     tested, live = 0, []
     last_upd = time.time()
 
     def _w(p):
-        return p, test_proxy_for_shopify(p)
+        return p, test_proxy_deep(p)
 
     with ThreadPoolExecutor(max_workers=50) as ex:
         futs = [ex.submit(_w, p) for p in all_p]
         for fut in as_completed(futs):
             tested += 1
             try:
-                p, ok = fut.result(timeout=90)
+                p, ok = fut.result(timeout=60)
             except Exception:
                 continue
-            if ok:
-                live.append(p)
+            if ok: live.append(p)
             now = time.time()
-            if now - last_upd >= 3:
+            if now - last_upd >= 2:
                 try:
                     safe_send(bot.edit_message_text,
                         f"🧹 {tested}/{len(all_p)} · ✅ {len(live)}",
@@ -1392,24 +1405,19 @@ def cmd_cleanshpro(message):
 def cmd_msh(message):
     if not _sub_gate(message):
         return
-    if not is_user_allowed(message.from_user.id) and not is_owner(message.from_user.id):
-        safe_send(bot.reply_to, message, "🚫 Premium required.")
-        return
     _set_await(message.from_user.id, 'awaiting_cards_file')
     safe_send(bot.reply_to, message,
         "<b>📦 SHOPIFY MASS</b>\n\n"
-        "Send a <b>.txt</b> of cards (one per line):\n"
-        "<code>CC|MM|YYYY|CVV</code>",
+        "Send a <b>.txt</b> of cards:\n<code>CC|MM|YYYY|CVV</code>",
         parse_mode='HTML')
 
-
-@bot.message_handler(commands=['stop'])
-def cmd_stop(message):
-    safe_send(bot.reply_to, message, "⏸️ Stop requested.")
-
-
 # ═══════════════════════════════════════════════════════════════════
-# POLL
+# DEBUG CATCH-ALL (registered LAST — fires after specific handlers)
+# ═══════════════════════════════════════════════════════════════════
+@bot.callback_query_handler(func=lambda c: True)
+def _debug_all_callbacks(call):
+    logger.info(f"🔍 CALLBACK RECEIVED: data={call.data!r} user={call.from_user.id}")
+
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     logger.info("🚀 Bot starting…")
